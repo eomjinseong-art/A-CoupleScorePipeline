@@ -66,7 +66,9 @@ def fetch_next_episode():
         print(f"  Sheets 접근 실패: {resp.status_code}")
         return None
 
-    reader = csv.DictReader(io.StringIO(resp.text))
+    # UTF-8로 명시적 디코딩 (Google Sheets CSV는 UTF-8)
+    content = resp.content.decode('utf-8')
+    reader = csv.DictReader(io.StringIO(content))
     for row_idx, row in enumerate(reader, start=2):  # 헤더=1행, 데이터=2행부터
         if row.get("Status", "").strip() == "대기":
             ep = {
