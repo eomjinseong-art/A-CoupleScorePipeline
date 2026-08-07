@@ -16,6 +16,10 @@ YT_REFRESH_TOKEN = os.environ.get("YT_REFRESH_TOKEN")
 THREADS_TOKEN = os.environ.get("THREADS_TOKEN")
 THREADS_USER_ID = "27227055083638713"
 GOOGLE_SERVICE_ACCOUNT = os.environ.get("GOOGLE_SERVICE_ACCOUNT")  # JSON string
+X_API_KEY = os.environ.get("X_API_KEY")
+X_API_SECRET = os.environ.get("X_API_SECRET")
+X_ACCESS_TOKEN = os.environ.get("X_ACCESS_TOKEN")
+X_ACCESS_SECRET = os.environ.get("X_ACCESS_SECRET")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ASSETS_DIR = os.path.join(BASE_DIR, "assets")
@@ -481,6 +485,60 @@ def post_threads(text):
         return False
 
 
+# ===== X (트위터) 포스팅 =====
+
+def post_x(text):
+    """OAuth 1.0a로 X에 텍스트 포스팅"""
+    print("  [X] 포스팅 중...")
+    if not all([X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_SECRET]):
+        print("  X 토큰 없음. 건너뜀.")
+        return False
+
+    import hashlib, hmac, urllib.parse, uuid
+
+    url = "https://api.x.com/2/tweets"
+    method = "POST"
+
+    # OAuth 1.0a 서명 생성
+    oauth_params = {
+        "oauth_consumer_key": X_API_KEY,
+        "oauth_nonce": uuid.uuid4().hex,
+        "oauth_signature_method": "HMAC-SHA1",
+        "oauth_timestamp": str(int(time.time())),
+        "oauth_token": X_ACCESS_TOKEN,
+        "oauth_version": "1.0"
+    }
+
+    # 서명 베이스 문자열
+    param_str = "&".join(f"{urllib.parse.quote(k, safe='')}={urllib.parse.quote(v, safe='')}"
+                         for k, v in sorted(oauth_params.items()))
+    base_str = f"{method}&{urllib.parse.quote(url, safe='')}&{urllib.parse.quote(param_str, safe='')}"
+    signing_key = f"{urllib.parse.quote(X_API_SECRET, safe='')}&{urllib.parse.quote(X_ACCESS_SECRET, safe='')}"
+    signature = base64.b64encode(
+        hmac.HMAC(signing_key.encode(), base_str.encode(), hashlib.sha1).digest()
+    ).decode()
+
+    oauth_params["oauth_signature"] = signature
+    auth_header = "OAuth " + ", ".join(
+        f'{k}="{urllib.parse.quote(v, safe="")}"' for k, v in sorted(oauth_params.items())
+    )
+
+    # 트윗 게시 (280자 제한)
+    tweet_text = text[:280] if len(text) > 280 else text
+    resp = requests.post(url, headers={
+        "Authorization": auth_header,
+        "Content-Type": "application/json"
+    }, json={"text": tweet_text})
+
+    if resp.status_code in (200, 201):
+        tweet_id = resp.json().get("data", {}).get("id")
+        print(f"  X 게시 완료: https://x.com/5xtpudstudio/status/{tweet_id}")
+        return True
+    else:
+        print(f"  X 게시 실패: {resp.status_code} {resp.text[:200]}")
+        return False
+
+
 # ===== Google Sheets 상태 업데이트 =====
 
 def get_sheets_service():
@@ -572,7 +630,10 @@ if __name__ == "__main__":
     # 5. Threads 포스팅
     threads_ok = post_threads(threads_text)
 
-    # 6. Google Sheets 상태 업데이트
+    # 6. X 포스팅
+    post_x(threads_text)
+
+    # 7. Google Sheets 상태 업데이트
     update_sheet_status(ep["row_num"], yt_id is not None, threads_ok)
 
     # 7. 완료
