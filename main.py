@@ -5,6 +5,8 @@
 import os, json, time, base64, subprocess, sys, shutil, csv, io
 import requests
 from PIL import Image, ImageDraw, ImageFont
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
 
 # === 환경 변수 ===
 GCP_TTS_KEY = os.environ.get("GCP_TTS_KEY")
@@ -13,6 +15,7 @@ YT_CLIENT_SECRET = os.environ.get("YT_CLIENT_SECRET")
 YT_REFRESH_TOKEN = os.environ.get("YT_REFRESH_TOKEN")
 THREADS_TOKEN = os.environ.get("THREADS_TOKEN")
 THREADS_USER_ID = "27227055083638713"
+GOOGLE_SERVICE_ACCOUNT = os.environ.get("GOOGLE_SERVICE_ACCOUNT")  # JSON string
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ASSETS_DIR = os.path.join(BASE_DIR, "assets")
@@ -64,7 +67,7 @@ def fetch_next_episode():
         return None
 
     reader = csv.DictReader(io.StringIO(resp.text))
-    for row in reader:
+    for row_idx, row in enumerate(reader, start=2):  # 헤더=1행, 데이터=2행부터
         if row.get("Status", "").strip() == "대기":
             ep = {
                 "ep": row.get("EP", "").strip(),
@@ -73,11 +76,12 @@ def fetch_next_episode():
                 "script": row.get("대본", "").strip(),
                 "question": row.get("마무리 질문", "").strip(),
                 "threads_text": row.get("Threads 글감", "").strip(),
+                "row_num": row_idx,  # Sheets 행 번호 (상태 업데이트용)
             }
             # 대본을 문장으로 분리
             sentences = [s.strip() for s in ep["script"].replace(". ", ".\n").split("\n") if s.strip()]
             ep["sentences"] = sentences
-            print(f"  대상: {ep['ep']} ({ep['gender']}) - {ep['topic']}편")
+            print(f"  대상: {ep['ep']} ({ep['gender']}) - {ep['topic']}편 (행 {row_idx})")
             return ep
     print("  대기 상태 에피소드 없음.")
     return None
@@ -475,6 +479,67 @@ def post_threads(text):
         return False
 
 
+# ===== Google Sheets 상태 업데이트 =====
+
+def get_sheets_service():
+    """Google Sheets API 서비스 생성"""
+    if not GOOGLE_SERVICE_ACCOUNT:
+        print("  GOOGLE_SERVICE_ACCOUNT 없음. Sheets 업데이트 건너뜀.")
+        return None
+    creds_info = json.loads(GOOGLE_SERVICE_ACCOUNT)
+    creds = Credentials.from_service_account_info(
+        creds_info, scopes=["https://www.googleapis.com/auth/spreadsheets"]
+    )
+    return build("sheets", "v4", credentials=creds)
+
+
+def update_sheet_status(row_num, yt_success, threads_success):
+    """Sheets에 상태 업데이트 + 셀 색상 변경"""
+    service = get_sheets_service()
+    if not service:
+        return
+
+    sheet = service.spreadsheets()
+
+    # Status 컬럼(A열)을 "완료"로 변경
+    if yt_success:
+        sheet.values().update(
+            spreadsheetId=SHEET_ID,
+            range=f"A{row_num}",
+            valueInputOption="RAW",
+            body={"values": [["완료"]]}
+        ).execute()
+
+        # A열 배경색 초록색
+        sheet.batchUpdate(
+            spreadsheetId=SHEET_ID,
+            body={"requests": [{
+                "repeatCell": {
+                    "range": {"sheetId": 0, "startRowIndex": row_num - 1, "endRowIndex": row_num,
+                              "startColumnIndex": 0, "endColumnIndex": 1},
+                    "cell": {"userEnteredFormat": {"backgroundColor": {"red": 0.56, "green": 0.93, "blue": 0.56}}},
+                    "fields": "userEnteredFormat.backgroundColor"
+                }
+            }]}
+        ).execute()
+
+    # Threads 글감 컬럼(G열) 배경색 분홍색
+    if threads_success:
+        sheet.batchUpdate(
+            spreadsheetId=SHEET_ID,
+            body={"requests": [{
+                "repeatCell": {
+                    "range": {"sheetId": 0, "startRowIndex": row_num - 1, "endRowIndex": row_num,
+                              "startColumnIndex": 6, "endColumnIndex": 7},
+                    "cell": {"userEnteredFormat": {"backgroundColor": {"red": 1.0, "green": 0.75, "blue": 0.8}}},
+                    "fields": "userEnteredFormat.backgroundColor"
+                }
+            }]}
+        ).execute()
+
+    print(f"  Sheets 상태 업데이트 완료 (행 {row_num})")
+
+
 # ===== 메인 =====
 
 if __name__ == "__main__":
@@ -503,9 +568,12 @@ if __name__ == "__main__":
     yt_id = upload_youtube(video_path, title, description)
 
     # 5. Threads 포스팅
-    post_threads(threads_text)
+    threads_ok = post_threads(threads_text)
 
-    # 6. 완료
+    # 6. Google Sheets 상태 업데이트
+    update_sheet_status(ep["row_num"], yt_id is not None, threads_ok)
+
+    # 7. 완료
     if yt_id:
         print(f"\n{'='*50}")
         print(f"완료! {ep['ep']} - {ep['topic']}편")
