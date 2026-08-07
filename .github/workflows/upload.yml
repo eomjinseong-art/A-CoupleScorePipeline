@@ -2,6 +2,7 @@ name: 그날의남녀 자동 업로드
 
 on:
   schedule:
+    # KST 8:00, 13:00, 19:00 → UTC 23:00(전날), 04:00, 10:00
     - cron: '0 23 * * *'
     - cron: '0 4 * * *'
     - cron: '0 10 * * *'
@@ -33,4 +34,10 @@ jobs:
           YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
           THREADS_TOKEN: ${{ secrets.THREADS_TOKEN }}
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+          X_API_KEY: ${{ secrets.X_API_KEY }}
+          X_API_SECRET: ${{ secrets.X_API_SECRET }}
+          X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
+          X_ACCESS_SECRET: ${{ secrets.X_ACCESS_SECRET }}
         run: python main.py
+
+
