@@ -2,6 +2,8 @@ name: 그날의남녀 자동 업로드
 
 on:
   schedule:
+    # KST 09:00 (오전 9시) → UTC 00:00
+    - cron: '0 0 * * *'
     # KST 21:00 (오후 9시) → UTC 12:00
     - cron: '0 12 * * *'
   workflow_dispatch:
@@ -22,7 +24,13 @@ jobs:
           sudo apt-get install -y ffmpeg fonts-noto-cjk
 
       - name: Install Python dependencies
-        run: pip install requests pillow google-auth google-api-python-client
+        run: pip install requests pillow google-auth google-api-python-client anthropic
+
+      - name: 에피소드 자동 보충
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+        run: python generate_episodes.py
 
       - name: Run upload pipeline
         env:
@@ -33,5 +41,3 @@ jobs:
           THREADS_TOKEN: ${{ secrets.THREADS_TOKEN }}
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
         run: python main.py
-
-
