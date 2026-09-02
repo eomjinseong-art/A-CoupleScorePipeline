@@ -63,10 +63,10 @@ for _fp in _font_candidates:
 if not font_path:
     raise FileNotFoundError(f"Noto Sans CJK 폰트를 찾을 수 없습니다. 후보: {_font_candidates}")
 
-font_title = ImageFont.truetype(font_path, 64)
-font_topic = ImageFont.truetype(font_path, 48)
-font_body = ImageFont.truetype(font_path, 46)
-font_closing = ImageFont.truetype(font_path, 44)
+font_title = ImageFont.truetype(font_path, 80)
+font_topic = ImageFont.truetype(font_path, 60)
+font_body = ImageFont.truetype(font_path, 56)
+font_closing = ImageFont.truetype(font_path, 52)
 
 
 # ===== Google Sheets 읽기 =====
@@ -182,24 +182,26 @@ def draw_stick(draw, cx, cy, gender, expr="neutral", scale=1.0):
     draw.line([bb, (cx+int(40*s), cy)], fill=WHITE, width=lw)
 
 
-def draw_text_top(draw, text, font, fill=WHITE):
+def draw_text_top(draw, text, font, fill=WHITE, start_y=350, max_chars=14):
+    """모바일 최적화된 텍스트 렌더링"""
     wrapped = ""
     for line in text.split("\n"):
-        while len(line) > 18:
-            wrapped += line[:18] + "\n"
-            line = line[18:]
+        while len(line) > max_chars:
+            wrapped += line[:max_chars] + "\n"
+            line = line[max_chars:]
         wrapped += line + "\n"
     wrapped = wrapped.strip()
     lines = wrapped.split("\n")
-    lh = font.size + 18
-    y = 200
+    lh = font.size + 28  # 줄 간격 대폭 증가
+    y = start_y
     for i, line in enumerate(lines):
         bbox = draw.textbbox((0, 0), line, font=font)
         tw = bbox[2] - bbox[0]
         x = W // 2 - tw // 2
         cy = y + i * lh
-        for dx in [-3, -2, -1, 0, 1, 2, 3]:
-            for dy in [-3, -2, -1, 0, 1, 2, 3]:
+        # 검은색 외곽선 (더 굵게)
+        for dx in [-4, -3, -2, -1, 0, 1, 2, 3, 4]:
+            for dy in [-4, -3, -2, -1, 0, 1, 2, 3, 4]:
                 if dx != 0 or dy != 0:
                     draw.text((x + dx, cy + dy), line, font=font, fill=(0, 0, 0))
         draw.text((x, cy), line, font=font, fill=fill)
@@ -219,16 +221,16 @@ def guess_expr(sentence):
 def make_cover(out, topic):
     img = Image.new("RGBA", (W, H), BG)
     draw = ImageDraw.Draw(img)
-    draw_text_top(draw, "저희 오늘 또\n싸웠습니다.", font_title)
+    draw_text_top(draw, "저희 오늘 또\n싸웠습니다.", font_title, start_y=320)
     lines = f"- {topic}편 -"
     bbox = draw.textbbox((0, 0), lines, font=font_topic)
     tw = bbox[2] - bbox[0]
     x = W // 2 - tw // 2
-    for dx in [-3, -2, -1, 0, 1, 2, 3]:
-        for dy in [-3, -2, -1, 0, 1, 2, 3]:
+    for dx in [-4, -3, -2, -1, 0, 1, 2, 3, 4]:
+        for dy in [-4, -3, -2, -1, 0, 1, 2, 3, 4]:
             if dx != 0 or dy != 0:
-                draw.text((x + dx, 420 + dy), lines, font=font_topic, fill=(0, 0, 0))
-    draw.text((x, 420), lines, font=font_topic, fill=YELLOW)
+                draw.text((x + dx, 520 + dy), lines, font=font_topic, fill=(0, 0, 0))
+    draw.text((x, 520), lines, font=font_topic, fill=YELLOW)
     draw_stick(draw, 370, 1350, "male", "angry", 1.4)
     draw_stick(draw, 710, 1350, "female", "angry", 1.4)
     img.save(out)
@@ -243,7 +245,7 @@ def make_body(out, text, gender, expr):
 def make_closing(out):
     img = Image.new("RGBA", (W, H), BG)
     draw = ImageDraw.Draw(img)
-    draw_text_top(draw, CLOSING_TEXT, font_closing)
+    draw_text_top(draw, CLOSING_TEXT, font_closing, max_chars=10)
     draw_stick(draw, 380, 1350, "male", "happy", 1.2)
     draw_stick(draw, 700, 1350, "female", "happy", 1.2)
     img.save(out)
@@ -251,8 +253,8 @@ def make_closing(out):
 def make_question(out, text):
     img = Image.new("RGBA", (W, H), BG)
     draw = ImageDraw.Draw(img)
-    draw_text_top(draw, text, font_body)
-    q_font = ImageFont.truetype(font_path, 150)
+    draw_text_top(draw, text, font_body, max_chars=12)
+    q_font = ImageFont.truetype(font_path, 200)
     bbox = draw.textbbox((0, 0), "?", font=q_font)
     tw = bbox[2] - bbox[0]
     draw.text((W // 2 - tw // 2, 750), "?", font=q_font, fill=YELLOW)
