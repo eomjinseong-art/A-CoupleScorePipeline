@@ -1,6 +1,6 @@
 """
 그날의 남녀 - 일일 자동화 파이프라인 (GitHub Actions용)
-전체 흐름: Google Sheets에서 대본 읽기 → 영상 생성 → YouTube 업로드 → Threads 포스팅
+전체 흐름: Google Sheets에서 대본 읽기 → 영상 생성 → YouTube 업로드 → Threads 포스팅 → 블로그 발행
 """
 import os, json, time, base64, subprocess, sys, shutil, csv, io
 import requests
@@ -621,7 +621,56 @@ if __name__ == "__main__":
     # 5. Threads 포스팅
     threads_ok = post_threads(threads_text)
 
-    # 6. Google Sheets 상태 업데이트
+    # 6. 블로그 콘텐츠 생성 + 발행
+    blog_ok = False
+    try:
+        from generate_blog_content import generate_blog_post, get_or_create_blog_sheet, find_next_row, load_client as load_blog_client
+        from publish_blogger import get_blogger_token, get_blog_id, publish_to_blogger, get_sheets_client
+
+        print("[8/9] 블로그 콘텐츠 생성 중...")
+        blog_data = generate_blog_post(ep)
+        if blog_data:
+            # 시트에 기록
+            gc = load_blog_client()
+            ws = get_or_create_blog_sheet(gc)
+            next_row = find_next_row(ws)
+            ep_num = ep["ep"].replace("EP.", "").replace("ep.", "").strip()
+            row_data = [
+                "대기", ep_num, blog_data["title"], blog_data["html"],
+                ",".join(blog_data["tags"]),
+                f"https://youtube.com/shorts/{yt_id}" if yt_id else "",
+                "", ""
+            ]
+            ws.update(range_name=f"A{next_row}:H{next_row}", values=[row_data])
+            print(f"  블로그 콘텐츠 기록 완료: {blog_data['title']}")
+
+            # Blogger 발행
+            print("[9/9] 블로거 발행 중...")
+            token = get_blogger_token()
+            if token:
+                blog_id, _ = get_blog_id(token)
+                if blog_id:
+                    post_url = publish_to_blogger(
+                        token, blog_id, blog_data["title"],
+                        blog_data["html"], ",".join(blog_data["tags"])
+                    )
+                    if post_url:
+                        blog_ok = True
+                        from datetime import datetime
+                        ws.update(range_name=f"A{next_row}:H{next_row}", values=[[
+                            "발행완료", ep_num, blog_data["title"], blog_data["html"],
+                            ",".join(blog_data["tags"]),
+                            f"https://youtube.com/shorts/{yt_id}" if yt_id else "",
+                            post_url, datetime.now().strftime("%Y-%m-%d %H:%M")
+                        ]])
+                else:
+                    print("  ❌ 블로그 ID 조회 실패")
+            else:
+                print("  ❌ Blogger 토큰 갱신 실패")
+    except Exception as e:
+        print(f"  ❌ 블로그 발행 중 오류: {e}")
+
+    # 7. Google Sheets 상태 업데이트
     update_sheet_status(ep["row_num"], yt_id is not None, threads_ok)
 
     # 완료 요약
@@ -631,6 +680,7 @@ if __name__ == "__main__":
     print(f"  영상 생성: ✅")
     print(f"  YouTube: {'✅ https://youtube.com/shorts/' + yt_id if yt_id else '❌ 실패'}")
     print(f"  Threads: {'✅' if threads_ok else '❌ 실패 (토큰 확인 필요)'}")
+    print(f"  블로그: {'✅' if blog_ok else '❌ 실패 (토큰/API 확인 필요)'}")
     print(f"{'='*50}")
 
     if not yt_id:
