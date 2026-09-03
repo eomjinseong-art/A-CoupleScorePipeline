@@ -7,7 +7,7 @@ import os, json, sys, csv, io
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
-from anthropic import Anthropic
+from openai import OpenAI
 
 SHEET_ID = "1l7niiK9RbZwo_x0PI6T2vCqjIKn9c_gvxVrrKjwyo20"
 SHEET_CSV_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid=0"
@@ -114,13 +114,13 @@ def find_next_row(ws):
 
 
 def generate_blog_post(ep):
-    """Claude API로 블로그 포스팅 HTML 생성"""
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    """OpenAI GPT로 블로그 포스팅 HTML 생성"""
+    api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
-        print("  ❌ ANTHROPIC_API_KEY 없음")
+        print("  ❌ OPENAI_API_KEY 없음")
         return None
 
-    client = Anthropic(api_key=api_key)
+    client = OpenAI(api_key=api_key)
     user_prompt = (
         f"화자: {ep['gender']}\n"
         f"주제: {ep['topic']}\n"
@@ -129,15 +129,18 @@ def generate_blog_post(ep):
         f"위 사연을 블로그 포스팅용 HTML로 변환해주세요."
     )
 
-    print(f"  Claude API 호출 중... (EP.{ep['ep']})")
-    message = client.messages.create(
-        model="claude-sonnet-4-6",
+    print(f"  OpenAI GPT 호출 중... (EP.{ep['ep']})")
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
         max_tokens=4000,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_prompt}],
+        temperature=0.7,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt}
+        ],
     )
 
-    raw = "".join(block.text for block in message.content if block.type == "text")
+    raw = response.choices[0].message.content
     raw = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
 
     try:
