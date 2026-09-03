@@ -143,29 +143,34 @@ def generate_blog_content(episode):
 
 
 def publish_to_blogger(token, blog_id, title, html, tags):
-    """Blogger에 발행 (429 재시도 포함)"""
-    labels = [t.strip() for t in tags.split(",") if t.strip()] if isinstance(tags, str) else tags
+    """Blogger AtomPub API로 발행 (v3 API 대신 사용)"""
+    import re
+    label_list = [t.strip() for t in tags.split(",") if t.strip()] if isinstance(tags, str) else tags
+    categories = "\n".join(
+        f"  <category scheme='http://www.blogger.com/atom/ns#' term='{label}'/>"
+        for label in label_list
+    ) if label_list else ""
 
-    payload = {
-        "kind": "blogger#post",
-        "blog": {"id": blog_id},
-        "title": title,
-        "content": html,
-        "labels": labels,
-    }
+    xml_body = f"""<?xml version='1.0' encoding='UTF-8'?>
+<entry xmlns='http://www.w3.org/2005/Atom'>
+  <title>{title}</title>
+{categories}
+  <content type='html'><![CDATA[{html}]]></content>
+</entry>"""
 
     for attempt in range(3):
         resp = requests.post(
-            f"{BLOGGER_API_BASE}/blogs/{blog_id}/posts",
+            f"https://www.blogger.com/feeds/{blog_id}/posts/default",
             headers={
                 "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
+                "Content-Type": "application/atom+xml",
             },
-            json=payload,
+            data=xml_body.encode("utf-8"),
         )
 
         if resp.status_code in (200, 201):
-            post_url = resp.json().get("url", "")
+            link_match = re.search(r'<link[^>]*href="([^"]*)"[^>]*rel="alternate"', resp.text)
+            post_url = link_match.group(1) if link_match else ""
             print(f"  발행 완료: {post_url}")
             return post_url
         elif resp.status_code == 429:
