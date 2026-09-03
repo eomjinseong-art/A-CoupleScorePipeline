@@ -68,6 +68,29 @@ def get_blog_id(token):
     return blog["id"]
 
 
+def get_existing_posts(token, blog_id):
+    """기존 블로그 포스트 목록에서 EP 번호 추출 (중복 방지)"""
+    existing = set()
+    url = f"{BLOGGER_API_BASE}/blogs/{blog_id}/posts?maxResults=50"
+    while url:
+        resp = requests.get(url, headers={"Authorization": f"Bearer {token}"})
+        if resp.status_code != 200:
+            break
+        data = resp.json()
+        for post in data.get("items", []):
+            title = post.get("title", "")
+            # EP 번호 추출
+            for word in title.split():
+                word = word.replace("EP.", "").replace("-", "")
+                if word.isdigit():
+                    existing.add(word)
+        url = data.get("nextPageToken")
+        if url:
+            url = f"{BLOGGER_API_BASE}/blogs/{blog_id}/posts?maxResults=50&pageToken={url}"
+    print(f"이미 발행된 에피소드: {len(existing)}개")
+    return existing
+
+
 def fetch_episodes():
     """Google Sheets에서 완료된 에피소드 읽기"""
     resp = requests.get(SHEET_CSV_URL)
@@ -183,17 +206,23 @@ def main():
     if not episodes:
         print("완료된 에피소드 없음"); return
 
-    # 블로그용 시트에서 기존 발행 기록 확인 (중복 방지)
-    # CSV로는 블로그용 탭을 읽을 수 없으므로, 모든 에피소드를 발행
-    # (이미 발행된 것은 Blogger에서 자동으로 중복 체크)
+    # 기존 발행 에피소드 확인 (중복 방지)
+    existing = get_existing_posts(token, blog_id)
 
     success = 0
     fail = 0
+    skip = 0
 
     for i, ep in enumerate(episodes):
         ep_num = ep.get("EP", "").replace("EP.", "")
         topic = ep.get("주제", "제목 없음")
         gender = ep.get("화자", "남자")
+
+        # 이미 발행된 에피소드 건너뛰기
+        if ep_num in existing:
+            print(f"\n[{i+1}/{len(episodes)}] EP.{ep_num} - 이미 발행됨, 건너뜀")
+            skip += 1
+            continue
 
         print(f"\n[{i+1}/{len(episodes)}] EP.{ep_num} - {topic} ({gender})")
 
@@ -219,7 +248,7 @@ def main():
         time.sleep(5)
 
     print(f"\n{'=' * 60}")
-    print(f"완료: {success}건 성공, {fail}건 실패 (총 {len(episodes)}건)")
+    print(f"완료: {success}건 성공, {fail}건 실패, {skip}건 건너뜀 (총 {len(episodes)}건)")
     print(f"{'=' * 60}")
 
 
