@@ -169,8 +169,11 @@ def publish_to_blogger(token, blog_id, title, html, tags):
         )
 
         if resp.status_code in (200, 201):
-            link_match = re.search(r'<link[^>]*href="([^"]*)"[^>]*rel="alternate"', resp.text)
-            post_url = link_match.group(1) if link_match else ""
+            # AtomPub는 쌍 따옴표 또는 홑 따옴표 사용
+            link_match = re.search(r"<link[^>]*href=['\"]([^'\"]*)['\"][^>]*rel=['\"]alternate['\"]", resp.text)
+            if not link_match:
+                link_match = re.search(r"<link[^>]*rel=['\"]alternate['\"][^>]*href=['\"]([^'\"]*)['\"]", resp.text)
+            post_url = link_match.group(1) if link_match else "https://couplescore-auto.blogspot.com/"
             print(f"  발행 완료: {post_url}")
             return post_url
         elif resp.status_code == 429:
