@@ -19,12 +19,13 @@ BLOGGER_API_BASE = "https://www.googleapis.com/blogger/v3"
 
 
 def get_blogger_token():
-    """YouTube OAuth 토큰으로 Blogger 접근 (동일 Google 계정)"""
-    client_id = os.environ.get("YT_CLIENT_ID")
-    client_secret = os.environ.get("YT_CLIENT_SECRET")
-    refresh_token = os.environ.get("YT_REFRESH_TOKEN")
+    """Blogger 전용 OAuth 토큰으로 접근"""
+    client_id = os.environ.get("BLOGGER_CLIENT_ID")
+    client_secret = os.environ.get("BLOGGER_CLIENT_SECRET")
+    refresh_token = os.environ.get("BLOGGER_REFRESH_TOKEN")
     if not all([client_id, client_secret, refresh_token]):
-        print("  ❌ YouTube OAuth 환경 변수 누락 (Blogger에도 사용)")
+        print("  ❌ Blogger OAuth 환경 변수 누락")
+        print("  → BLOGGER_CLIENT_ID, BLOGGER_CLIENT_SECRET, BLOGGER_REFRESH_TOKEN 필요")
         return None
     resp = requests.post("https://oauth2.googleapis.com/token", data={
         "client_id": client_id, "client_secret": client_secret,
