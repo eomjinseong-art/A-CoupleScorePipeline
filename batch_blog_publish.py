@@ -120,7 +120,7 @@ def generate_blog_content(episode):
 
 
 def publish_to_blogger(token, blog_id, title, html, tags):
-    """Blogger에 발행"""
+    """Blogger에 발행 (429 재시도 포함)"""
     labels = [t.strip() for t in tags.split(",") if t.strip()] if isinstance(tags, str) else tags
 
     payload = {
@@ -131,22 +131,31 @@ def publish_to_blogger(token, blog_id, title, html, tags):
         "labels": labels,
     }
 
-    resp = requests.post(
-        f"{BLOGGER_API_BASE}/blogs/{blog_id}/posts",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
-        json=payload,
-    )
+    for attempt in range(3):
+        resp = requests.post(
+            f"{BLOGGER_API_BASE}/blogs/{blog_id}/posts",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        )
 
-    if resp.status_code in (200, 201):
-        post_url = resp.json().get("url", "")
-        print(f"  발행 완료: {post_url}")
-        return post_url
-    else:
-        print(f"  발행 실패 ({resp.status_code}): {resp.text[:200]}")
-        return None
+        if resp.status_code in (200, 201):
+            post_url = resp.json().get("url", "")
+            print(f"  발행 완료: {post_url}")
+            return post_url
+        elif resp.status_code == 429:
+            wait = 30 * (attempt + 1)
+            print(f"  Rate limit (429), {wait}초 대기 후 재시도...")
+            time.sleep(wait)
+            continue
+        else:
+            print(f"  발행 실패 ({resp.status_code}): {resp.text[:200]}")
+            return None
+
+    print(f"  3회 재시도 실패")
+    return None
 
 
 def main():
@@ -206,8 +215,8 @@ def main():
         else:
             fail += 1
 
-        # API rate limit 방지
-        time.sleep(2)
+        # API rate limit 방지 (Blogger는 분당 30건 제한)
+        time.sleep(5)
 
     print(f"\n{'=' * 60}")
     print(f"완료: {success}건 성공, {fail}건 실패 (총 {len(episodes)}건)")
