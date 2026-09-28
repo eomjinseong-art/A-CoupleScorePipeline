@@ -20,7 +20,7 @@
 ## 실행 시간
 - 매일 한국 시간 09:00: Threads + 블로그 (YouTube 없음)
 - 매일 한국 시간 21:00: YouTube Short 1편 + Threads + 블로그
-- 대기가 30개 이하면 Claude가 편이 갈리는 주제 30개를 추가
+- 대기가 30개 이하면 OpenAI가 편이 갈리는 주제 30개를 추가
 - N01–N20 원작 주제는 없을 때만 시트 맨 아래에 대기 행으로 추가 (기존 셀은 수정하지 않음)
 - 수동 실행은 기본으로 YouTube를 올리지 않음. "upload_youtube"를 켜면 올림
 - 업로드 없이 확인: `python main.py --dry-run`, 추가될 주제 확인: `python generate_episodes.py --plan`
