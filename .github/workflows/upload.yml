@@ -2,11 +2,16 @@ name: 그날의남녀 자동 업로드
 
 on:
   schedule:
-    # KST 09:00 (오전 9시) → UTC 00:00
+    # KST 09:00 → UTC 00:00. Threads·블로그만. YouTube는 올리지 않는다.
     - cron: '0 0 * * *'
-    # KST 21:00 (오후 9시) → UTC 12:00
+    # KST 21:00 → UTC 12:00. YouTube Short 1편 + Threads·블로그.
     - cron: '0 12 * * *'
   workflow_dispatch:
+    inputs:
+      upload_youtube:
+        description: "YouTube Short도 업로드 (하루 1편은 21:00 KST 예약만)"
+        type: boolean
+        default: false
 
 jobs:
   upload:
@@ -45,4 +50,6 @@ jobs:
           BLOGGER_CLIENT_ID: ${{ secrets.BLOGGER_CLIENT_ID }}
           BLOGGER_CLIENT_SECRET: ${{ secrets.BLOGGER_CLIENT_SECRET }}
           BLOGGER_REFRESH_TOKEN: ${{ secrets.BLOGGER_REFRESH_TOKEN }}
+          # 21:00 KST 예약이거나, 수동 실행에서 업로드를 켠 경우에만 YouTube.
+          YOUTUBE_UPLOAD: ${{ (github.event.schedule == '0 12 * * *' || inputs.upload_youtube == true || inputs.upload_youtube == 'true') && 'true' || 'false' }}
         run: python main.py
