@@ -2,14 +2,15 @@
 그날의 남녀 - 에피소드 자동 보충 스크립트
 
 Google Sheets에서 "대기" 상태의 에피소드가 특정 임계값 이하로 떨어지면,
-Claude API를 사용하여 새 에피소드 30개를 자동으로 생성하여 시트에 추가한다.
+OpenAI API를 사용하여 새 에피소드 30개를 자동으로 생성하여 시트에 추가한다.
 
 필요 환경변수:
-  ANTHROPIC_API_KEY
+  OPENAI_API_KEY
+  OPENAI_MODEL (기본값 gpt-4.1-mini)
   GOOGLE_SERVICE_ACCOUNT
 
 필요 패키지:
-  pip install anthropic google-auth google-api-python-client requests
+  pip install openai google-auth google-api-python-client requests
 """
 
 import os
@@ -17,6 +18,7 @@ import json
 import csv
 import io
 import sys
+import time
 
 import requests
 
@@ -38,6 +40,57 @@ REFILL_THRESHOLD = int(os.environ.get("REFILL_THRESHOLD", "30"))
 BATCH_SIZE = int(os.environ.get("REFILL_BATCH_SIZE", "30"))
 
 SYSTEM_PROMPT = REFILL_SYSTEM_PROMPT
+
+DEFAULT_OPENAI_MODEL = "gpt-4.1-mini"
+# 첫 실패 후 1초, 2초, 4초. 네 번째 실패에서 예외를 올린다.
+OPENAI_RETRY_BACKOFF_SECONDS = (1, 2, 4)
+
+EPISODE_JSON_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["episodes"],
+    "properties": {
+        "episodes": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["화자", "주제", "훅", "대본", "심리", "마무리_질문", "Threads_글감"],
+                "properties": {
+                    "화자": {"type": "string", "enum": ["남자", "여자"]},
+                    "주제": {"type": "string"},
+                    "훅": {"type": "string"},
+                    "대본": {"type": "string"},
+                    "심리": {"type": "string"},
+                    "마무리_질문": {"type": "string"},
+                    "Threads_글감": {"type": "string"},
+                },
+            },
+        }
+    },
+}
+
+
+def openai_model():
+    return (os.environ.get("OPENAI_MODEL") or DEFAULT_OPENAI_MODEL).strip() or DEFAULT_OPENAI_MODEL
+
+
+def parse_generated_payload(raw):
+    """모델 응답을 에피소드 배열로 맞춘다.
+
+    구조화 출력은 {"episodes": [...]} 이고,
+    JSON 배열만 오는 응답도 같은 항목 스키마로 받는다.
+    """
+    text = (raw or "").strip()
+    if text.startswith("```"):
+        text = text.removeprefix("```json").removeprefix("```").strip()
+        text = text.removesuffix("```").strip()
+    data = json.loads(text)
+    if isinstance(data, dict) and isinstance(data.get("episodes"), list):
+        data = data["episodes"]
+    if not isinstance(data, list):
+        raise ValueError(f"예상치 못한 응답 형식: {type(data)}")
+    return data
 
 
 def load_sheets_service():
@@ -106,8 +159,8 @@ def get_next_ep_number(service):
     return max(ep_nums, default=0) + 1
 
 
-def generate_episodes(client, existing_topics, count):
-    """Claude API를 사용하여 새 에피소드 생성"""
+def generate_episodes(client, existing_topics, count, sleep=time.sleep):
+    """OpenAI API로 새 에피소드를 만든다. 실패하면 지수 백오프로 재시도한다."""
     topics_text = "\n".join(f"- {t}" for t in existing_topics) if existing_topics else "(없음)"
     user_prompt = (
         f"아래는 이미 사용된 주제 목록입니다. 띄어쓰기와 '편'을 빼면 같은 주제, "
@@ -115,25 +168,45 @@ def generate_episodes(client, existing_topics, count):
         f"댓글이 남자 편/여자 편으로 갈리는 소재 {count}개를 만드세요. "
         f"절반 이상은 돈·소비, 온도차, 기념일, 전 애인, 새벽 연락, 리모컨 결입니다. "
         f"각 항목에 훅, 심리 한 줄, '남자쪽 / 여자쪽' 마무리 질문을 넣으세요.\n"
-        f"JSON 배열 {count}개, 스키마 그대로 출력하세요."
+        f'출력은 {{"episodes": [에피소드 {count}개]}} JSON 하나입니다. 각 항목은 스키마 그대로 쓰세요.'
     )
+    model = openai_model()
+    request = {
+        "model": model,
+        "max_completion_tokens": 16000,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "episode_batch",
+                "strict": True,
+                "schema": EPISODE_JSON_SCHEMA,
+            },
+        },
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+    }
 
-    print(f"  Claude API 호출 중... ({count}개 생성 요청)")
-    message = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=16000,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_prompt}],
-    )
-
-    raw = "".join(block.text for block in message.content if block.type == "text")
-    raw = raw.strip().removeprefix("```json").removesuffix("```").strip()
-    data = json.loads(raw)
-
-    if not isinstance(data, list):
-        raise ValueError(f"예상치 못한 응답 형식: {type(data)}")
-
-    return data
+    print(f"  OpenAI API 호출 중... ({count}개 생성 요청, 모델 {model})")
+    attempts = len(OPENAI_RETRY_BACKOFF_SECONDS) + 1
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            response = client.chat.completions.create(**request)
+            message = response.choices[0].message
+            refusal = getattr(message, "refusal", None)
+            if refusal:
+                raise ValueError(f"모델이 생성을 거절했습니다: {refusal}")
+            return parse_generated_payload(message.content)
+        except Exception as exc:
+            last_error = exc
+            if attempt >= len(OPENAI_RETRY_BACKOFF_SECONDS):
+                raise
+            wait = OPENAI_RETRY_BACKOFF_SECONDS[attempt]
+            print(f"  OpenAI 호출 실패, {wait}초 후 재시도 ({attempt + 1}회차): {exc}")
+            sleep(wait)
+    raise last_error
 
 
 def validate_episode(ep, idx, existing_topics):
@@ -235,12 +308,12 @@ def main(argv=None):
 
     print("  ⚠ 임계값 이하! 보충 시작...")
 
-    print(f"[2/4] Claude API로 {BATCH_SIZE}개 에피소드 생성...")
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    print(f"[2/4] OpenAI API로 {BATCH_SIZE}개 에피소드 생성...")
+    api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
-        raise SystemExit("ANTHROPIC_API_KEY 환경변수가 필요합니다.")
-    from anthropic import Anthropic
-    client = Anthropic(api_key=api_key)
+        raise SystemExit("OPENAI_API_KEY 환경변수가 필요합니다.")
+    from openai import OpenAI
+    client = OpenAI(api_key=api_key)
 
     existing_topics = get_existing_topics(service)
     print(f"  기존 주제 {len(existing_topics)}개 확인")

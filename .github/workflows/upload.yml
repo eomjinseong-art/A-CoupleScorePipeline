@@ -29,11 +29,12 @@ jobs:
           sudo apt-get install -y ffmpeg fonts-noto-cjk
 
       - name: Install Python dependencies
-        run: pip install requests pillow google-auth google-api-python-client openai anthropic gspread
+        run: pip install requests pillow google-auth google-api-python-client openai gspread
 
       - name: 에피소드 자동 보충
+        continue-on-error: true
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
         run: python generate_episodes.py
 
