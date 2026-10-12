@@ -24,6 +24,15 @@ OVERRIDES_CSV = os.path.join(DATA_DIR, "ep078_107_overrides.csv")
 TOPICS_CSV = os.path.join(DATA_DIR, "topics_n01_n20.csv")
 
 # 남성은 낮고 느리게, 여성은 높고 또렷하게. 같은 성우를 쓰지 않는다.
+OPENAI_TTS_MODEL = "gpt-4o-mini-tts"
+OPENAI_TTS_SPEED = 1.2
+OPENAI_VOICES = {"male": "cedar", "female": "marin"}
+OPENAI_TTS_INSTRUCTIONS = {
+    "male": "20대 중반 한국 남성. 밝고 자연스럽고 캐주얼한 말투, 친구에게 썰 푸는 느낌. 너무 낮거나 무겁지 않게, 빠른 템포.",
+    "female": "20대 중반 한국 여성. 생기 있고 자연스럽고 캐주얼한 말투, 친구에게 썰 푸는 느낌. 과장 없이 또렷하게, 빠른 템포.",
+}
+
+# Google TTS fallback
 VOICES = {
     "male": {"languageCode": "ko-KR", "name": "ko-KR-Wavenet-C"},
     "female": {"languageCode": "ko-KR", "name": "ko-KR-Neural2-A"},

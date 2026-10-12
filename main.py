@@ -8,6 +8,10 @@ from PIL import ImageDraw
 
 from shorts_format import (
     AUDIO_CONFIGS,
+    OPENAI_TTS_INSTRUCTIONS,
+    OPENAI_TTS_MODEL,
+    OPENAI_TTS_SPEED,
+    OPENAI_VOICES,
     VOICES,
     YOUTUBE_TAGS,
     build_description,
@@ -182,27 +186,61 @@ def num_to_korean(text):
     for k, v in char_map.items(): text = text.replace(k, v)
     return text
 
-def gen_tts(text, gender, out):
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+OPENAI_TTS_URL = "https://api.openai.com/v1/audio/speech"
+
+
+def _write_resampled(audio_bytes, out):
+    raw = out + ".raw"
+    with open(raw, "wb") as f:
+        f.write(audio_bytes)
+    r = subprocess.run(["ffmpeg", "-y", "-i", raw, "-ar", str(SAMPLE_RATE), "-ac", "1", out], capture_output=True)
+    os.remove(raw)
+    return r.returncode == 0 and os.path.exists(out)
+
+
+def _gen_tts_openai(text, gender, out):
+    if not OPENAI_API_KEY:
+        print("  ⚠️ OPENAI_API_KEY 없음 → Google TTS 사용")
+        return False
+    try:
+        resp = requests.post(OPENAI_TTS_URL, headers={"Authorization": f"Bearer {OPENAI_API_KEY}"}, json={
+            "model": OPENAI_TTS_MODEL, "voice": OPENAI_VOICES[gender], "input": text,
+            "instructions": OPENAI_TTS_INSTRUCTIONS[gender], "speed": OPENAI_TTS_SPEED,
+            "response_format": "mp3",
+        }, timeout=120)
+    except Exception as e:
+        print(f"  ⚠️ OpenAI TTS 오류: {e} → Google TTS 사용")
+        return False
+    if resp.status_code == 200 and resp.content and _write_resampled(resp.content, out):
+        return True
+    print(f"  ⚠️ OpenAI TTS 실패 ({resp.status_code}): {resp.text[:200]} → Google TTS 사용")
+    return False
+
+
+def _gen_tts_google(text, gender, out):
     if not GCP_TTS_KEY:
         print("  ❌ GCP_TTS_KEY 환경 변수가 없습니다.")
         return False
-    text = num_to_korean(text)
     resp = requests.post(TTS_URL, json={
         "input": {"text": text}, "voice": VOICES[gender], "audioConfig": AUDIO_CONFIGS[gender]
     })
     if resp.status_code == 200:
-        raw = out + ".raw"
-        with open(raw, "wb") as f:
-            f.write(base64.b64decode(resp.json()["audioContent"]))
-        subprocess.run(["ffmpeg", "-y", "-i", raw, "-ar", str(SAMPLE_RATE), "-ac", "1", out], capture_output=True)
-        os.remove(raw)
-        return True
+        return _write_resampled(base64.b64decode(resp.json()["audioContent"]), out)
     print(f"  ❌ TTS 실패 ({resp.status_code}): {resp.text[:200]}")
     if resp.status_code == 403:
         print("  → GCP TTS API 키가 유효하지 않거나 quota가 초과되었습니다.")
     elif resp.status_code == 400:
         print("  → TTS 요청 데이터가 올바르지 않습니다.")
     return False
+
+
+def gen_tts(text, gender, out):
+    """OpenAI gpt-4o-mini-tts (cedar/marin, speed 1.2) 우선, 실패 시 Google TTS."""
+    text = num_to_korean(text)
+    if _gen_tts_openai(text, gender, out):
+        return True
+    return _gen_tts_google(text, gender, out)
 
 def get_dur(p):
     return float(subprocess.check_output([
