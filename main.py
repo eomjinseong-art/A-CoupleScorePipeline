@@ -16,6 +16,7 @@ from shorts_format import (
     YOUTUBE_TAGS,
     build_description,
     build_lines,
+    build_reconcile_lines,
     build_threads_text,
     build_title,
     contains_english_learning,
@@ -24,6 +25,8 @@ from shorts_format import (
     render_card,
     youtube_upload_enabled,
 )
+
+import reconcile
 
 # === 환경 변수 ===
 GCP_TTS_KEY = os.environ.get("GCP_TTS_KEY")
@@ -52,6 +55,21 @@ RED = (255, 90, 90)
 
 
 # ===== Google Sheets 읽기 =====
+
+def fetch_queue_episode(index=None):
+    """'우리 오늘 화해했어요' 큐(data/reconcile_episodes.json)를 시트보다 먼저 쓴다."""
+    if (os.environ.get("RECONCILE_QUEUE") or "on").strip().lower() in ("0", "off", "false", "no"):
+        return None
+    queue = reconcile.load_queue()
+    idx = reconcile.slot_index() if index is None else index
+    ep = reconcile.next_queue_episode(queue=queue, index=idx)
+    if ep:
+        print(f"[1/7] 화해 큐 사용: 슬롯 {idx} / {len(queue)}개 → {ep['ep']} ({ep['speaker_ko']}) - {ep['topic']}")
+        print(f"  훅: {ep['hook']}")
+    else:
+        print(f"[1/7] 화해 큐 범위 밖 (슬롯 {idx} / {len(queue)}개) → 시트로 돌아갑니다.")
+    return ep
+
 
 def fetch_next_episode():
     """Google Sheets에서 Status='대기'인 첫 번째 에피소드를 가져옴.
@@ -273,7 +291,7 @@ def _silent_audio(path, dur):
 def generate_video(ep, with_tts=True, work_dir=None):
     """첫 장면은 갈등 훅. 남녀 목소리를 나누고, 끝은 심리 한 줄과 편 투표."""
     print("[3/7] 영상 생성 중...")
-    lines = build_lines(ep)
+    lines = build_reconcile_lines(ep) if ep.get("source") == "reconcile" else build_lines(ep)
     d = work_dir or WORK_DIR
     if os.path.exists(d):
         shutil.rmtree(d)
@@ -335,7 +353,7 @@ def generate_video(ep, with_tts=True, work_dir=None):
 
 # ===== YouTube 업로드 =====
 
-def upload_youtube(video_path, title, description):
+def upload_youtube(video_path, title, description, tags=None):
     print("[7/7] YouTube 업로드 중...")
 
     # 환경 변수 존재 여부 확인
@@ -376,7 +394,7 @@ def upload_youtube(video_path, title, description):
         json={
             "snippet": {
                 "title": title, "description": description,
-                "tags": list(YOUTUBE_TAGS),
+                "tags": list(tags or YOUTUBE_TAGS),
                 "categoryId": "22"
             },
             "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": False}
@@ -402,11 +420,32 @@ def upload_youtube(video_path, title, description):
 
 # ===== Threads 포스팅 =====
 
+def _norm(text):
+    return "".join((text or "").split())
+
+
+def already_on_threads(text):
+    """같은 글이 최근에 이미 올라갔는지 (수동 재실행 등으로 인한 중복 방지). 조회 실패 시 False."""
+    try:
+        resp = requests.get(
+            f"https://graph.threads.net/v1.0/{THREADS_USER_ID}/threads",
+            params={"fields": "text", "limit": 25, "access_token": THREADS_TOKEN}, timeout=30)
+        if resp.status_code != 200:
+            return False
+        key = _norm(text)[:120]
+        return any(_norm(p.get("text"))[:120] == key for p in resp.json().get("data", []))
+    except Exception:
+        return False
+
+
 def post_threads(text):
     print("  [Threads] 포스팅 중...")
     if not THREADS_TOKEN:
         print("  ❌ THREADS_TOKEN 환경 변수가 없습니다. 건너뜀.")
         return False
+    if already_on_threads(text):
+        print("  ⏭ 같은 글이 이미 Threads에 있어 건너뜀 (중복 방지)")
+        return True
 
     resp = requests.post(
         f"https://graph.threads.net/v1.0/{THREADS_USER_ID}/threads",
@@ -507,22 +546,39 @@ def update_sheet_status(row_num, yt_success, threads_success):
 def run(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     dry_run = "--dry-run" in argv
+    index = None
+    if "--index" in argv:
+        index = int(argv[argv.index("--index") + 1])
     print("=" * 50)
     print("그날의 남녀 - 자동화 파이프라인")
     print("=" * 50)
 
-    ep = fetch_next_episode()
+    ep = fetch_queue_episode(index) or fetch_next_episode()
     if not ep:
         print("\n⚠ 처리할 에피소드가 없습니다. 다음 실행을 기다립니다.")
         return 1
 
-    title = build_title(ep["hook"], ep["ep"])
-    description = build_description(ep)
-    threads_text = build_threads_text(ep)
+    from_queue = ep.get("source") == "reconcile"
+    if from_queue:
+        title = reconcile.build_title(ep)
+        description = reconcile.build_description(ep)
+        threads_text = reconcile.build_threads_text(ep)
+        tags = reconcile.YOUTUBE_TAGS
+    else:
+        title = build_title(ep["hook"], ep["ep"])
+        description = build_description(ep)
+        threads_text = build_threads_text(ep)
+        tags = YOUTUBE_TAGS
     upload_yt = youtube_upload_enabled() and not dry_run
     print(f"  제목: {title}")
     print(f"  YouTube 업로드: {'예' if upload_yt else '생략'}")
-    if any(contains_english_learning(tag) for tag in YOUTUBE_TAGS):
+    if dry_run:
+        print("----- Threads 미리보기 -----")
+        print(threads_text)
+        print("----- YouTube 설명 미리보기 -----")
+        print(description)
+        print("-----------------------------")
+    if any(contains_english_learning(tag) for tag in tags):
         print("  ❌ 태그에 영어학습 키워드가 있습니다.")
         return 1
 
@@ -535,7 +591,7 @@ def run(argv=None):
             print(f"  미리보기 영상: {video_path}")
             print("  업로드·시트 기록은 하지 않습니다.")
             return 0
-        yt_id = upload_youtube(video_path, title, description)
+        yt_id = upload_youtube(video_path, title, description, tags)
     else:
         print("[3/7] YouTube를 올리지 않는 실행이라 영상 생성도 건너뜁니다.")
 
@@ -594,7 +650,10 @@ def run(argv=None):
     # 09:00 실행은 영상을 올리지 않으므로, Threads나 블로그가 되면 행을 소진한다.
     # 21:00 실행은 영상이 올라간 뒤에만 완료로 바꾼다.
     consumed = (yt_id is not None) if upload_yt else (threads_ok or blog_ok)
-    update_sheet_status(ep["row_num"], consumed, threads_ok)
+    if from_queue:
+        print("  화해 큐 회차라 시트는 건드리지 않습니다 (슬롯 번호로 진행).")
+    else:
+        update_sheet_status(ep["row_num"], consumed, threads_ok)
 
     # 완료 요약
     print(f"\n{'='*50}")
