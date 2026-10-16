@@ -465,6 +465,47 @@ def build_lines(ep):
     return lines
 
 
+RECONCILE_TURN = ("화해", "미안", "사과", "그날 저녁", "다음 날", "결국", "그래도")
+
+
+def reconcile_expr(sentence, made_up):
+    """'화' 가 '화해' 에도 들어 있으니 화해편은 따로 고른다. 화해로 넘어간 뒤는 웃는 얼굴."""
+    if made_up:
+        return "talking" if '"' in sentence or "“" in sentence else "happy"
+    if any(w in sentence for w in ["서운", "울", "힘들"]):
+        return "sad"
+    if '"' in sentence or "“" in sentence:
+        return "talking"
+    return "angry"
+
+
+def build_reconcile_lines(ep):
+    """화해편: 싸움 훅 → 싸움 2~3줄 → 화해 장면 → 오늘의 화해 한 줄 → '여러분은 어떻게 화해해요?'"""
+    speaker = ep["speaker"]
+    partner = "female" if speaker == "male" else "male"
+    lines = [Shot(role="hook", display=ep["hook"], spoken=ep["hook"], voice=speaker,
+                  stick="both", expr="angry", min_duration=2.0)]
+    fight = ep.get("fight") or ""
+    makeup = ep.get("makeup") or ""
+    if not (fight and makeup):
+        parts = (ep.get("script") or "").split("\n\n", 1)
+        fight, makeup = (parts[0], parts[1]) if len(parts) == 2 else ("", parts[0])
+    for made_up, block in ((False, fight), (True, makeup)):
+        # 화해 큐는 한 줄 = 한 문장. 따옴표 속 마침표에서 자르지 않도록 줄 단위로 나눈다.
+        units = [u.strip() for u in block.split("\n") if u.strip()] if "\n" in block else split_sentences(block)
+        for sentence in units:
+            voice = sentence_voice(sentence, speaker)
+            lines.append(Shot(role="body", display=sentence, spoken=sentence, voice=voice,
+                              stick=voice, expr=reconcile_expr(sentence, made_up)))
+    warm = ep.get("psychology") or ""
+    lines.append(Shot(role="warm", display=warm, spoken=warm, voice=partner,
+                      stick="both", expr="happy", min_duration=1.6))
+    question = ep.get("question") or "여러분은 어떻게 화해해요?"
+    lines.append(Shot(role="ask", display=question, spoken=question + " 댓글로 알려 주세요.",
+                      voice=speaker, stick="both", expr="happy", min_duration=1.8))
+    return lines
+
+
 def voices_in(lines):
     return {line.voice for line in lines}
 
@@ -539,6 +580,16 @@ def layout_card(shot, font_path):
         label_font, label, y = fit_block("한 줄 심리", font_path, 40, 32, 1, y)
         font, placed, _ = fit_block(shot.display, font_path, 54, 40, 5, y + 8)
         return [(label_font, label, YELLOW), (font, placed, WHITE)]
+    if shot.role == "warm":
+        y = SAFE_TOP + 20
+        label_font, label, y = fit_block("오늘의 화해", font_path, 40, 32, 1, y)
+        font, placed, _ = fit_block(shot.display, font_path, 54, 40, 5, y + 8)
+        return [(label_font, label, PINK), (font, placed, WHITE)]
+    if shot.role == "ask":
+        y = SAFE_TOP + 10
+        title_font, title, y = fit_block(shot.display, font_path, 72, 48, 3, y)
+        font, placed, _ = fit_block("댓글로 알려 주세요", font_path, 46, 34, 2, y + 24)
+        return [(title_font, title, YELLOW), (font, placed, WHITE)]
     if shot.role == "poll":
         blocks = [("남자 편 vs 여자 편", 72, 48, YELLOW, 2)]
         if shot.poll_male and shot.poll_female:

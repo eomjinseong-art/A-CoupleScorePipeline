@@ -38,6 +38,17 @@ SYSTEM_PROMPT = """당신은 한국어 블로그 작가입니다. 커플 싸운 
 }"""
 
 
+RECONCILE_SYSTEM_PROMPT = SYSTEM_PROMPT.replace(
+    "커플 싸운 이야기를", "커플이 싸웠다가 화해한 이야기('우리 오늘 화해했어요')를"
+).replace(
+    "4. 조언: 구체적인 해결법이나 건강한 소통법 제시",
+    "4. 화해: 사과 한마디·작은 선물·산책·그날 입은 옷처럼 구체적인 화해 장면을 따뜻하게 살리고, 따라 해 볼 만한 화해 팁 제시",
+).replace(
+    "5. 마무리: 독자에게 질문 + 댓글 유도",
+    "5. 마무리: '여러분은 어떻게 화해해요?'처럼 화해 경험을 묻는 질문 + 댓글 유도. 누가 잘못했는지 투표는 하지 않음",
+)
+
+
 def get_blogger_credentials():
     """Blogger API용 Google 인증 (YouTube와 동일한 OAuth 토큰 사용)"""
     client_id = os.environ.get("YT_CLIENT_ID")
@@ -135,7 +146,7 @@ def generate_blog_post(ep):
         max_tokens=4000,
         temperature=0.7,
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": RECONCILE_SYSTEM_PROMPT if ep.get("source") == "reconcile" else SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt}
         ],
     )
