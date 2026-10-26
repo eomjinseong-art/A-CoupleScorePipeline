@@ -234,8 +234,7 @@ def ensure_fresh_threads_token(force: bool = False) -> str | None:
     if sealed:
         meta_payload["sealed_for_github_actions"] = sealed
 
-    META_FILE.write_text(json.dumps(meta_payload, indent=2) + "
-", encoding="utf-8")
+    META_FILE.write_text(json.dumps(meta_payload, indent=2) + "\n", encoding="utf-8")
     _commit_and_push_meta()
 
     print(
