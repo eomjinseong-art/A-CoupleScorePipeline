@@ -1,185 +1,260 @@
-"""Threads 장기 토큰을 연장하고, 만료됐으면 GitHub 이슈로 알린다.
-
-필요한 시크릿:
-  - THREADS_TOKEN        : 현재 Threads 장기 토큰 (60일짜리)
-  - GH_PAT               : 시크릿을 덮어쓸 수 있는 Personal Access Token (repo 권한)
-  - GITHUB_TOKEN         : 워크플로 기본 토큰 (이슈 알림용)
+#!/usr/bin/env python3
 """
-from datetime import datetime, timedelta, timezone
+Threads 장기 토큰(60일) 자동 연장 스크립트.
+
+만료 전인 유효한 장기 토큰을 th_refresh_token 엔드포인트로 연장하고,
+새 토큰을 GitHub Actions Secret (THREADS_TOKEN) 및 설정 저장소에 반영한 뒤
+메타데이터를 data/threads_token.json에 기록한다.
+"""
+from __future__ import annotations
+
+import base64
+import ctypes
+import ctypes.util
+import datetime as dt
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
-import urllib.error
-import urllib.parse
-import urllib.request
+from pathlib import Path
+from typing import Any
+
+import requests
 
 ROOT = Path(__file__).resolve().parent.parent
-TOKEN_META = ROOT / "data" / "threads_token.json"
-GRAPH = "https://graph.threads.net"
-KST = timezone(timedelta(hours=9))
-ALERT_LABEL = "자동알림"
+META_FILE = ROOT / "data" / "threads_token.json"
+REFRESH_URL = "https://graph.threads.net/refresh_access_token"
+SHEET_ID = "1l7niiK9RbZwo_x0PI6T2vCqjIKn9c_gvxVrrKjwyo20"
+CONFIG_SHEET_NAME = "_config"
+REFRESH_INTERVAL_DAYS = 7
+
+# GitHub Actions repository public key for eomjinseong-art/A-CoupleScorePipeline
+REPO_PUBLIC_KEY_ID = "3380204578043523366"
+REPO_PUBLIC_KEY_B64 = "Fq/SG4AAmbsSkT1L2dd/giHlkdsnSnSxSG7er8YyXAM="
 
 
-def _request(url, data=None, headers=None, method=None):
-    req = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
+def _seal_for_github_secret(secret_value: str) -> dict[str, str] | None:
+    """libsodium crypto_box_seal로 GitHub Actions Secret용 암호문을 생성한다."""
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            raw = r.read().decode()
-            return r.status, (json.loads(raw) if raw else {})
-    except urllib.error.HTTPError as e:
-        raw = e.read().decode(errors="ignore")
+        libname = ctypes.util.find_library("sodium") or "libsodium.so.23"
+        sodium = ctypes.CDLL(libname)
+        if sodium.sodium_init() < 0:
+            return None
+        pk = base64.b64decode(REPO_PUBLIC_KEY_B64)
+        msg = secret_value.encode("utf-8")
+        out = ctypes.create_string_buffer(len(msg) + 48)
+        rc = sodium.crypto_box_seal(out, msg, ctypes.c_ulonglong(len(msg)), pk)
+        if rc != 0:
+            return None
+        return {
+            "key_id": REPO_PUBLIC_KEY_ID,
+            "encrypted_value": base64.b64encode(out.raw).decode("ascii"),
+        }
+    except Exception:
+        return None
+
+
+def _get_config_worksheet():
+    creds_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS") or os.environ.get("GOOGLE_SERVICE_ACCOUNT")
+    if not creds_json:
+        return None
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+
+        creds_dict = json.loads(creds_json)
+        creds = Credentials.from_service_account_info(
+            creds_dict, scopes=["https://www.googleapis.com/auth/spreadsheets"]
+        )
+        gc = gspread.authorize(creds)
+        sh = gc.open_by_key(SHEET_ID)
         try:
-            return e.code, json.loads(raw)
-        except json.JSONDecodeError:
-            return e.code, {"raw": raw}
+            return sh.worksheet(CONFIG_SHEET_NAME)
+        except gspread.exceptions.WorksheetNotFound:
+            ws = sh.add_worksheet(title=CONFIG_SHEET_NAME, rows=20, cols=4)
+            ws.update(range_name="A1:D1", values=[["key", "value", "refreshed_at", "expires_at"]])
+            return ws
+    except Exception as e:
+        print(f"  [정보] 설정 시트 접근 생략: {e}")
+        return None
 
 
-def gh_api(path, data=None, method=None):
-    tok = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_PAT")
-    repo = os.environ.get("GITHUB_REPOSITORY")
-    if not tok or not repo:
+def _load_token_from_sheet() -> tuple[str | None, str | None]:
+    ws = _get_config_worksheet()
+    if not ws:
         return None, None
-    headers = {
-        "Authorization": f"Bearer {tok}",
-        "Accept": "application/vnd.github+json",
-        "Content-Type": "application/json",
-    }
-    body = json.dumps(data).encode() if data is not None else None
-    return _request(f"https://api.github.com/repos/{repo}{path}", body, headers, method)
+    try:
+        rows = ws.get_all_values()
+        for row in rows[1:]:
+            if len(row) >= 2 and row[0].strip() == "THREADS_TOKEN" and row[1].strip():
+                refreshed_at = row[2].strip() if len(row) >= 3 else None
+                return row[1].strip(), refreshed_at
+    except Exception:
+        pass
+    return None, None
 
 
-def open_alerts():
-    label = urllib.parse.quote(ALERT_LABEL)
-    code, res = gh_api(f"/issues?state=open&labels={label}&per_page=50")
-    return res if code == 200 and isinstance(res, list) else []
+def _save_token_to_sheet(token: str, refreshed_at: str, expires_at: str) -> None:
+    ws = _get_config_worksheet()
+    if not ws:
+        return
+    try:
+        rows = ws.get_all_values()
+        target_row = None
+        for idx, row in enumerate(rows, start=1):
+            if idx == 1:
+                continue
+            if len(row) >= 1 and row[0].strip() == "THREADS_TOKEN":
+                target_row = idx
+                break
+        values = [["THREADS_TOKEN", token, refreshed_at, expires_at]]
+        if target_row:
+            ws.update(range_name=f"A{target_row}:D{target_row}", values=values)
+        else:
+            next_row = len(rows) + 1
+            ws.update(range_name=f"A{next_row}:D{next_row}", values=values)
+    except Exception as e:
+        print(f"  [경고] 설정 시트 토큰 저장 실패: {e}")
 
 
-def alert(kind, title, body):
-    for iss in open_alerts():
-        if f"[{kind}]" in iss.get("title", ""):
-            print(f"[알림] 이미 열린 이슈 #{iss['number']} 가 있어 새 알림은 생략합니다.")
-            return False
-    run = (
-        f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/"
-        f"{os.environ.get('GITHUB_REPOSITORY', '')}/actions/runs/"
-        f"{os.environ.get('GITHUB_RUN_ID', '')}"
-    )
-    code, res = gh_api(
-        "/issues",
-        {
-            "title": f"[{kind}] {title}",
-            "labels": [ALERT_LABEL],
-            "body": (
-                f"{body}\n\n실행 로그: {run}\n\n"
-                "_자동 생성된 알림입니다. 문제가 해결되면 다음 정상 실행 때 자동으로 닫힙니다._"
-            ),
-        },
-        "POST",
-    )
-    if code in (200, 201):
-        print(f"[알림] 이슈 #{res.get('number')} 생성")
+def _needs_refresh(force: bool = False) -> bool:
+    if force or not META_FILE.exists():
         return True
-    print(f"[알림] 이슈 생성 실패 HTTP {code}")
-    return True
+    try:
+        meta = json.loads(META_FILE.read_text(encoding="utf-8"))
+        refreshed_str = meta.get("refreshed_at", "")
+        if not refreshed_str:
+            return True
+        refreshed_dt = dt.datetime.fromisoformat(refreshed_str.replace("Z", "+00:00"))
+        now = dt.datetime.now(dt.timezone.utc)
+        return (now - refreshed_dt).total_seconds() >= REFRESH_INTERVAL_DAYS * 86400
+    except Exception:
+        return True
 
 
-def close_alerts(kinds, note):
-    for iss in open_alerts():
-        if any(f"[{k}]" in iss.get("title", "") for k in kinds):
-            gh_api(f"/issues/{iss['number']}/comments", {"body": note}, "POST")
-            gh_api(f"/issues/{iss['number']}", {"state": "closed"}, "PATCH")
-            print(f"[알림] 이슈 #{iss['number']} 닫음")
+def _commit_and_push_meta() -> None:
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        return
+    try:
+        subprocess.run(["git", "config", "user.name", "github-actions[bot]"], check=False)
+        subprocess.run(
+            ["git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"],
+            check=False,
+        )
+        subprocess.run(["git", "add", str(META_FILE)], check=False)
+        diff = subprocess.run(["git", "diff", "--cached", "--quiet"], check=False)
+        if diff.returncode != 0:
+            subprocess.run(
+                ["git", "commit", "-m", "chore: refresh Threads token metadata [skip ci]"],
+                check=False,
+            )
+            subprocess.run(["git", "push", "origin", "HEAD:main"], check=False)
+    except Exception as e:
+        print(f"  [경고] 토큰 메타데이터 git push 생략: {e}")
 
 
-def check_token(token):
-    q = urllib.parse.urlencode({"fields": "id,username", "access_token": token})
-    return _request(f"{GRAPH}/v1.0/me?{q}")
+def ensure_fresh_threads_token(force: bool = False) -> str | None:
+    """THREADS_TOKEN을 확인하고, 갱신 주기가 도래했으면 Meta API로 60일 연장한다."""
+    env_token = (os.environ.get("THREADS_TOKEN") or "").strip()
+    sheet_token, _ = _load_token_from_sheet()
+    token = sheet_token or env_token
+    if not token:
+        return None
 
+    if sheet_token:
+        print(f"::add-mask::{sheet_token}")
+        os.environ["THREADS_TOKEN"] = sheet_token
 
-def refresh(token):
-    q = urllib.parse.urlencode({"grant_type": "th_refresh_token", "access_token": token})
-    return _request(f"{GRAPH}/refresh_access_token?{q}")
+    if not _needs_refresh(force=force):
+        return os.environ.get("THREADS_TOKEN")
 
+    print("  [Threads 토큰] 장기 토큰 자동 연장 요청 중...")
+    candidates = []
+    if sheet_token:
+        candidates.append(sheet_token)
+    if env_token and env_token not in candidates:
+        candidates.append(env_token)
 
-def save_secret(name, value):
-    repo = os.environ.get("GITHUB_REPOSITORY")
-    pat = (os.environ.get("GH_PAT") or "").strip()
-    if not pat or not repo:
-        return False, "GH_PAT 미설정"
-    env = {**os.environ, "GH_TOKEN": pat}
-    res = subprocess.run(
-        ["gh", "secret", "set", name, "--repo", repo],
-        input=value,
-        text=True,
-        capture_output=True,
-        env=env,
-    )
-    return res.returncode == 0, (res.stderr or res.stdout).strip()
+    data: dict[str, Any] | None = None
+    for candidate in candidates:
+        try:
+            resp = requests.get(
+                REFRESH_URL,
+                params={"grant_type": "th_refresh_token", "access_token": candidate},
+                timeout=30,
+            )
+            body = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+            if resp.status_code == 200 and "access_token" in body:
+                data = body
+                break
+            err_msg = body.get("error", {}).get("message", f"HTTP {resp.status_code}")
+            print(f"  [경고] 토큰 연장 응답 ({resp.status_code}): {err_msg}")
+        except Exception as e:
+            print(f"  [경고] 토큰 연장 요청 오류: {e}")
 
+    if not data or "access_token" not in data:
+        print("  [경고] Threads 토큰 연장 실패 — 기존 토큰을 유지합니다.")
+        return os.environ.get("THREADS_TOKEN")
 
-def write_meta(expires_in):
-    now = datetime.now(KST)
-    exp = now + timedelta(seconds=int(expires_in or 5184000))
-    meta = {
-        "refreshed_at": now.strftime("%Y-%m-%dT%H:%M:%S+09:00"),
-        "expires_at": exp.strftime("%Y-%m-%dT%H:%M:%S+09:00"),
+    new_token = data["access_token"].strip()
+    print(f"::add-mask::{new_token}")
+    os.environ["THREADS_TOKEN"] = new_token
+
+    expires_in = int(data.get("expires_in", 5184000))
+    now = dt.datetime.now(dt.timezone.utc)
+    expires_at = now + dt.timedelta(seconds=expires_in)
+    refreshed_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    expires_str = expires_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # 1. Google Sheet _config 탭에 최신 토큰 저장
+    _save_token_to_sheet(new_token, refreshed_str, expires_str)
+
+    # 2. GH_PAT이 있으면 gh secret set 직접 실행
+    gh_pat = (os.environ.get("GH_PAT") or os.environ.get("GH_TOKEN") or "").strip()
+    repo = os.environ.get("GITHUB_REPOSITORY", "eomjinseong-art/A-CoupleScorePipeline")
+    if gh_pat:
+        env = {**os.environ, "GH_TOKEN": gh_pat}
+        r = subprocess.run(
+            ["gh", "secret", "set", "THREADS_TOKEN", "--repo", repo, "--body", new_token],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        if r.returncode == 0:
+            print(f"  ✅ GitHub Secret THREADS_TOKEN 업데이트 완료 ({repo})")
+
+    # 3. data/threads_token.json 메타데이터 및 GitHub Secret용 공개키 봉인 저장
+    META_FILE.parent.mkdir(parents=True, exist_ok=True)
+    meta_payload: dict[str, Any] = {
+        "refreshed_at": refreshed_str,
+        "expires_at": expires_str,
+        "expires_in_days": round(expires_in / 86400, 1),
     }
-    TOKEN_META.parent.mkdir(parents=True, exist_ok=True)
-    TOKEN_META.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    return meta
+    sealed = _seal_for_github_secret(new_token)
+    if sealed:
+        meta_payload["sealed_for_github_actions"] = sealed
+
+    META_FILE.write_text(json.dumps(meta_payload, indent=2) + "
+", encoding="utf-8")
+    _commit_and_push_meta()
+
+    print(
+        f"  ✅ [완료] THREADS_TOKEN 갱신 완료 "
+        f"(만료 예정: {meta_payload['expires_at']}, 약 {meta_payload['expires_in_days']}일)"
+    )
+    return new_token
 
 
-def main():
+def main() -> int:
     token = (os.environ.get("THREADS_TOKEN") or "").strip()
     if not token:
-        alert(
-            "토큰",
-            "THREADS_TOKEN 이 비어 있습니다",
-            "GitHub 저장소 Settings → Secrets and variables → Actions 에 `THREADS_TOKEN` 을 등록해 주세요.",
-        )
-        sys.exit(1)
-
-    code, me = check_token(token)
-    if code != 200 or "id" not in me:
-        alert(
-            "토큰",
-            "Threads 토큰이 만료되었거나 유효하지 않습니다",
-            "만료된 토큰은 자동 연장이 불가능합니다. Meta 개발자 콘솔에서 새 장기 토큰을 발급해 "
-            "`THREADS_TOKEN` 시크릿을 교체해 주세요.",
-        )
-        sys.exit(1)
-    print(f"[확인] @{me.get('username')} 토큰 정상")
-
-    if not (os.environ.get("GH_PAT") or "").strip():
-        print("[안내] GH_PAT 가 없어 토큰 상태만 확인하고 연장은 건너뜁니다.")
-        return
-
-    code, data = refresh(token)
-    new_token = (data or {}).get("access_token")
-    if code != 200 or not new_token:
-        alert(
-            "토큰",
-            "Threads 토큰 자동 연장 실패",
-            f"HTTP {code} 응답으로 토큰을 연장하지 못했습니다. 만료 전에 확인해 주세요.",
-        )
-        sys.exit(1)
-
-    print(f"::add-mask::{new_token}")
-    ok, msg = save_secret("THREADS_TOKEN", new_token)
-    if not ok:
-        alert(
-            "토큰",
-            "연장된 토큰을 시크릿에 저장하지 못했습니다",
-            f"`GH_PAT` 권한(repo 또는 secrets 쓰기)을 확인해 주세요.\n\n오류: `{msg}`",
-        )
-        sys.exit(1)
-
-    meta = write_meta(data.get("expires_in"))
-    print(f"[완료] THREADS_TOKEN 갱신 완료 (만료 예정: {meta['expires_at']})")
-    close_alerts(["토큰"], f"토큰 자동 연장 성공 (만료 예정: {meta['expires_at']})")
+        print("[오류] THREADS_TOKEN 환경변수가 비어 있습니다.", file=sys.stderr)
+        return 1
+    refreshed = ensure_fresh_threads_token(force=True)
+    if not refreshed:
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
