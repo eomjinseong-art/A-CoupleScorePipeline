@@ -144,7 +144,7 @@ def main():
         for b in items:
             print(f"   - id={b.get('id')} name={b.get('name')} url={b.get('url')} status={b.get('status')}")
 
-    blog_id = get_blog_id(token)
+    blog_id, _ = get_blog_id(token)
     if not blog_id:
         print("블로그 ID 조회 실패")
         sys.exit(1)
