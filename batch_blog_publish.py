@@ -43,6 +43,8 @@ def main():
     parser.add_argument("--limit", type=int, default=50, help="최대 발행 개수 (기본 50, 0=무제한)")
     parser.add_argument("--delay", type=int, default=10, help="글 간 대기 시간 초 (기본 10)")
     args = parser.parse_args()
+    args.limit = min(args.limit, 1) if args.limit else 1
+    args.delay = min(args.delay, 2)
 
     print("=" * 60)
     print("그날의남녀 - 기존 에피소드 일괄 블로그 발행")
