@@ -1,0 +1,44 @@
+name: Refresh Threads Token
+
+on:
+  schedule:
+    # 매주 일요일 00:00 UTC (09:00 KST) — 60일 만료 전에 자동 연장
+    - cron: "0 0 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests gspread google-auth
+
+      - name: Refresh Threads long-lived token
+        env:
+          THREADS_TOKEN: ${{ secrets.THREADS_TOKEN }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python scripts/refresh_token.py
+
+      - name: Close alert issues on success
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for num in $(gh issue list --repo "${{ github.repository }}" --state open --label "token-alert" --json number --jq '.[].number'); do
+            gh issue close "$num" --repo "${{ github.repository }}" --comment "토큰 자동 갱신이 성공하여 이슈를 닫습니다."
+          done
