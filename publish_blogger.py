@@ -19,8 +19,12 @@ import time
 from xml.sax.saxutils import escape, quoteattr
 
 import requests
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
+try:
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+except ImportError:
+    service_account = None
+    build = None
 
 SHEET_ID = "1l7niiK9RbZwo_x0PI6T2vCqjIKn9c_gvxVrrKjwyo20"
 BLOG_SHEET = "블로그용"
