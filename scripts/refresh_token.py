@@ -1,259 +1,222 @@
 #!/usr/bin/env python3
 """
-Threads 장기 토큰(60일) 자동 연장 스크립트.
-
-만료 전인 유효한 장기 토큰을 th_refresh_token 엔드포인트로 연장하고,
-새 토큰을 GitHub Actions Secret (THREADS_TOKEN) 및 설정 저장소에 반영한 뒤
-메타데이터를 data/threads_token.json에 기록한다.
+Threads 장기 토큰(Long-Lived Token) 자동 연장 스크립트
+- Meta Threads API: https://graph.threads.net/refresh_access_token
+- 만료 전(생성 후 24시간 경과 ~ 60일 이내) 호출 시 60일 연장됨
+- 연장된 토큰을:
+  1) 현재 프로세스 환경변수(THREADS_TOKEN)에 즉시 반영
+  2) GitHub Actions Secret (THREADS_TOKEN) 업데이트 (GH_PAT 시크릿이 주입된 경우)
+  3) Google Sheets 비공개 _config 탭에 백업 저장 (차기 실행 시 최신 토큰 자동 로드)
+  4) data/threads_token.json 에 갱신 일시/만료 예정일 메타데이터 기록
 """
-from __future__ import annotations
 
-import base64
-import ctypes
-import ctypes.util
-import datetime as dt
 import json
 import os
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
 
 import requests
 
-ROOT = Path(__file__).resolve().parent.parent
-META_FILE = ROOT / "data" / "threads_token.json"
-REFRESH_URL = "https://graph.threads.net/refresh_access_token"
-SHEET_ID = "1l7niiK9RbZwo_x0PI6T2vCqjIKn9c_gvxVrrKjwyo20"
-CONFIG_SHEET_NAME = "_config"
-REFRESH_INTERVAL_DAYS = 7
-
-# GitHub Actions repository public key for eomjinseong-art/A-CoupleScorePipeline
-REPO_PUBLIC_KEY_ID = "3380204578043523366"
-REPO_PUBLIC_KEY_B64 = "Fq/SG4AAmbsSkT1L2dd/giHlkdsnSnSxSG7er8YyXAM="
+META_PATH = Path(__file__).resolve().parent.parent / "data" / "threads_token.json"
+REFRESH_INTERVAL_DAYS = 7  # 7일 이상 경과 시 자동 갱신
 
 
-def _seal_for_github_secret(secret_value: str) -> dict[str, str] | None:
-    """libsodium crypto_box_seal로 GitHub Actions Secret용 암호문을 생성한다."""
-    try:
-        libname = ctypes.util.find_library("sodium") or "libsodium.so.23"
-        sodium = ctypes.CDLL(libname)
-        if sodium.sodium_init() < 0:
-            return None
-        pk = base64.b64decode(REPO_PUBLIC_KEY_B64)
-        msg = secret_value.encode("utf-8")
-        out = ctypes.create_string_buffer(len(msg) + 48)
-        rc = sodium.crypto_box_seal(out, msg, ctypes.c_ulonglong(len(msg)), pk)
-        if rc != 0:
-            return None
-        return {
-            "key_id": REPO_PUBLIC_KEY_ID,
-            "encrypted_value": base64.b64encode(out.raw).decode("ascii"),
-        }
-    except Exception:
-        return None
+def _load_meta() -> dict:
+    if META_PATH.exists():
+        try:
+            return json.loads(META_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
 
 
-def _get_config_worksheet():
-    creds_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS") or os.environ.get("GOOGLE_SERVICE_ACCOUNT")
-    if not creds_json:
-        return None
+def _save_meta(meta: dict) -> None:
+    META_PATH.parent.mkdir(parents=True, exist_ok=True)
+    META_PATH.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _get_sheet_stored_token() -> str:
+    """Google Sheets 비공개 _config 워크시트에 저장된 최신 THREADS_TOKEN 조회"""
+    creds_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS", "").strip()
+    sheet_id = os.environ.get("GOOGLE_SHEET_ID", "1l7niiK9RbZwo_x0PI6T2vCqjIKn9c_gvxVrrKjwyo20").strip()
+    if not creds_json or not sheet_id:
+        return ""
     try:
         import gspread
         from google.oauth2.service_account import Credentials
-
         creds_dict = json.loads(creds_json)
-        creds = Credentials.from_service_account_info(
-            creds_dict, scopes=["https://www.googleapis.com/auth/spreadsheets"]
-        )
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
         gc = gspread.authorize(creds)
-        sh = gc.open_by_key(SHEET_ID)
-        try:
-            return sh.worksheet(CONFIG_SHEET_NAME)
-        except gspread.exceptions.WorksheetNotFound:
-            ws = sh.add_worksheet(title=CONFIG_SHEET_NAME, rows=20, cols=4)
-            ws.update(range_name="A1:D1", values=[["key", "value", "refreshed_at", "expires_at"]])
-            return ws
-    except Exception as e:
-        print(f"  [정보] 설정 시트 접근 생략: {e}")
-        return None
-
-
-def _load_token_from_sheet() -> tuple[str | None, str | None]:
-    ws = _get_config_worksheet()
-    if not ws:
-        return None, None
-    try:
+        sh = gc.open_by_key(sheet_id)
+        ws = sh.worksheet("_config")
         rows = ws.get_all_values()
-        for row in rows[1:]:
-            if len(row) >= 2 and row[0].strip() == "THREADS_TOKEN" and row[1].strip():
-                refreshed_at = row[2].strip() if len(row) >= 3 else None
-                return row[1].strip(), refreshed_at
+        for row in rows:
+            if len(row) >= 2 and row[0] == "THREADS_TOKEN" and row[1].strip():
+                return row[1].strip()
     except Exception:
         pass
-    return None, None
+    return ""
 
 
-def _save_token_to_sheet(token: str, refreshed_at: str, expires_at: str) -> None:
-    ws = _get_config_worksheet()
-    if not ws:
-        return
+def _save_sheet_stored_token(token: str, expires_iso: str) -> bool:
+    """Google Sheets 비공개 _config 워크시트에 최신 THREADS_TOKEN 백업"""
+    creds_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS", "").strip()
+    sheet_id = os.environ.get("GOOGLE_SHEET_ID", "1l7niiK9RbZwo_x0PI6T2vCqjIKn9c_gvxVrrKjwyo20").strip()
+    if not creds_json or not sheet_id:
+        return False
     try:
-        rows = ws.get_all_values()
-        target_row = None
-        for idx, row in enumerate(rows, start=1):
-            if idx == 1:
-                continue
-            if len(row) >= 1 and row[0].strip() == "THREADS_TOKEN":
-                target_row = idx
-                break
-        values = [["THREADS_TOKEN", token, refreshed_at, expires_at]]
-        if target_row:
-            ws.update(range_name=f"A{target_row}:D{target_row}", values=values)
-        else:
-            next_row = len(rows) + 1
-            ws.update(range_name=f"A{next_row}:D{next_row}", values=values)
-    except Exception as e:
-        print(f"  [경고] 설정 시트 토큰 저장 실패: {e}")
-
-
-def _needs_refresh(force: bool = False) -> bool:
-    if force or not META_FILE.exists():
+        import gspread
+        from google.oauth2.service_account import Credentials
+        creds_dict = json.loads(creds_json)
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        gc = gspread.authorize(creds)
+        sh = gc.open_by_key(sheet_id)
+        try:
+            ws = sh.worksheet("_config")
+        except gspread.WorksheetNotFound:
+            ws = sh.add_worksheet(title="_config", rows=10, cols=4)
+        ws.update("A1:C2", [
+            ["key", "value", "expires_at"],
+            ["THREADS_TOKEN", token, expires_iso],
+        ])
         return True
-    try:
-        meta = json.loads(META_FILE.read_text(encoding="utf-8"))
-        refreshed_str = meta.get("refreshed_at", "")
-        if not refreshed_str:
-            return True
-        refreshed_dt = dt.datetime.fromisoformat(refreshed_str.replace("Z", "+00:00"))
-        now = dt.datetime.now(dt.timezone.utc)
-        return (now - refreshed_dt).total_seconds() >= REFRESH_INTERVAL_DAYS * 86400
     except Exception:
-        return True
+        return False
 
 
-def _commit_and_push_meta() -> None:
-    if os.environ.get("GITHUB_ACTIONS") != "true":
+def _update_github_secret(new_token: str) -> bool:
+    """GH_PAT 환경변수가 있을 경우 GitHub Actions THREADS_TOKEN 시크릿 업데이트"""
+    gh_pat = os.environ.get("GH_PAT", "").strip()
+    repo = os.environ.get("GITHUB_REPOSITORY", "eomjinseong-art/A-CoupleScorePipeline").strip()
+    if not gh_pat:
+        return False
+    try:
+        env = os.environ.copy()
+        env["GH_TOKEN"] = gh_pat
+        res = subprocess.run(
+            ["gh", "secret", "set", "THREADS_TOKEN", "--repo", repo],
+            input=new_token.encode("utf-8"),
+            env=env,
+            capture_output=True,
+            timeout=30,
+        )
+        return res.returncode == 0
+    except Exception:
+        return False
+
+
+def _commit_meta_if_ci() -> None:
+    """GitHub Actions 실행 중이면 data/threads_token.json 메타데이터 커밋 & 푸시"""
+    if not os.environ.get("GITHUB_ACTIONS"):
         return
     try:
         subprocess.run(["git", "config", "user.name", "github-actions[bot]"], check=False)
         subprocess.run(
-            ["git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"],
+            ["git", "config", "user.email", "github-actions[bot]@users.noreply.github.com"],
             check=False,
         )
-        subprocess.run(["git", "add", str(META_FILE)], check=False)
-        diff = subprocess.run(["git", "diff", "--cached", "--quiet"], check=False)
+        subprocess.run(["git", "add", str(META_PATH)], check=False)
+        diff = subprocess.run(["git", "diff", "--cached", "--quiet"])
         if diff.returncode != 0:
             subprocess.run(
-                ["git", "commit", "-m", "chore: refresh Threads token metadata [skip ci]"],
+                ["git", "commit", "-m", "chore: update threads token refresh metadata [skip ci]"],
                 check=False,
             )
-            subprocess.run(["git", "push", "origin", "HEAD:main"], check=False)
-    except Exception as e:
-        print(f"  [경고] 토큰 메타데이터 git push 생략: {e}")
+            subprocess.run(["git", "push"], check=False)
+    except Exception:
+        pass
 
 
-def ensure_fresh_threads_token(force: bool = False) -> str | None:
-    """THREADS_TOKEN을 확인하고, 갱신 주기가 도래했으면 Meta API로 60일 연장한다."""
-    env_token = (os.environ.get("THREADS_TOKEN") or "").strip()
-    sheet_token, _ = _load_token_from_sheet()
-    token = sheet_token or env_token
-    if not token:
-        return None
+def ensure_fresh_threads_token(force: bool = False) -> str:
+    """
+    THREADS_TOKEN을 확인하고, 마지막 갱신 후 7일 이상 지났거나 force=True이면
+    Meta refresh_access_token 엔드포인트로 60일 연장한다.
+    반환값: 유효한 최신 THREADS_TOKEN 문자열
+    """
+    env_token = os.environ.get("THREADS_TOKEN", "").strip()
+    sheet_token = _get_sheet_stored_token()
+    current_token = sheet_token or env_token
 
-    if sheet_token:
-        print(f"::add-mask::{sheet_token}")
+    if not current_token:
+        print("  ⚠️ [Threads 토큰] THREADS_TOKEN이 설정되지 않았습니다.")
+        return ""
+
+    if sheet_token and sheet_token != env_token:
         os.environ["THREADS_TOKEN"] = sheet_token
+        print(f"::add-mask::{sheet_token}")
 
-    if not _needs_refresh(force=force):
-        return os.environ.get("THREADS_TOKEN")
+    meta = _load_meta()
+    now = datetime.now(timezone.utc)
+
+    if not force and meta.get("refreshed_at"):
+        try:
+            last_refreshed = datetime.fromisoformat(meta["refreshed_at"].replace("Z", "+00:00"))
+            elapsed_days = (now - last_refreshed).total_seconds() / 86400
+            if elapsed_days < REFRESH_INTERVAL_DAYS:
+                return current_token
+        except Exception:
+            pass
 
     print("  [Threads 토큰] 장기 토큰 자동 연장 요청 중...")
-    candidates = []
-    if sheet_token:
-        candidates.append(sheet_token)
-    if env_token and env_token not in candidates:
-        candidates.append(env_token)
-
-    data: dict[str, Any] | None = None
-    for candidate in candidates:
-        try:
-            resp = requests.get(
-                REFRESH_URL,
-                params={"grant_type": "th_refresh_token", "access_token": candidate},
-                timeout=30,
-            )
-            body = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
-            if resp.status_code == 200 and "access_token" in body:
-                data = body
-                break
-            err_msg = body.get("error", {}).get("message", f"HTTP {resp.status_code}")
-            print(f"  [경고] 토큰 연장 응답 ({resp.status_code}): {err_msg}")
-        except Exception as e:
-            print(f"  [경고] 토큰 연장 요청 오류: {e}")
-
-    if not data or "access_token" not in data:
-        print("  [경고] Threads 토큰 연장 실패 — 기존 토큰을 유지합니다.")
-        return os.environ.get("THREADS_TOKEN")
-
-    new_token = data["access_token"].strip()
-    print(f"::add-mask::{new_token}")
-    os.environ["THREADS_TOKEN"] = new_token
-
-    expires_in = int(data.get("expires_in", 5184000))
-    now = dt.datetime.now(dt.timezone.utc)
-    expires_at = now + dt.timedelta(seconds=expires_in)
-    refreshed_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-    expires_str = expires_at.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    # 1. Google Sheet _config 탭에 최신 토큰 저장
-    _save_token_to_sheet(new_token, refreshed_str, expires_str)
-
-    # 2. GH_PAT이 있으면 gh secret set 직접 실행
-    gh_pat = (os.environ.get("GH_PAT") or os.environ.get("GH_TOKEN") or "").strip()
-    repo = os.environ.get("GITHUB_REPOSITORY", "eomjinseong-art/A-CoupleScorePipeline")
-    if gh_pat:
-        env = {**os.environ, "GH_TOKEN": gh_pat}
-        r = subprocess.run(
-            ["gh", "secret", "set", "THREADS_TOKEN", "--repo", repo, "--body", new_token],
-            env=env,
-            capture_output=True,
-            text=True,
+    try:
+        resp = requests.get(
+            "https://graph.threads.net/refresh_access_token",
+            params={
+                "grant_type": "th_refresh_token",
+                "access_token": current_token,
+            },
+            timeout=30,
         )
-        if r.returncode == 0:
-            print(f"  ✅ GitHub Secret THREADS_TOKEN 업데이트 완료 ({repo})")
+    except Exception as e:
+        print(f"  ⚠️ [Threads 토큰] 갱신 요청 네트워크 오류 (기존 토큰 유지): {e}")
+        return current_token
 
-    # 3. data/threads_token.json 메타데이터 및 GitHub Secret용 공개키 봉인 저장
-    META_FILE.parent.mkdir(parents=True, exist_ok=True)
-    meta_payload: dict[str, Any] = {
-        "refreshed_at": refreshed_str,
-        "expires_at": expires_str,
-        "expires_in_days": round(expires_in / 86400, 1),
+    if resp.status_code != 200:
+        print(f"  ⚠️ [Threads 토큰] 갱신 응답 코드 {resp.status_code} (기존 토큰 유지)")
+        return current_token
+
+    data = resp.json()
+    new_token = data.get("access_token", "").strip()
+    expires_in = int(data.get("expires_in", 0) or 0)
+
+    if not new_token:
+        print("  ⚠️ [Threads 토큰] 응답에 access_token이 없습니다 (기존 토큰 유지)")
+        return current_token
+
+    # GitHub Actions 로그에 토큰이 절대 노출되지 않도록 마스킹
+    if os.environ.get("GITHUB_ACTIONS"):
+        print(f"::add-mask::{new_token}")
+
+    os.environ["THREADS_TOKEN"] = new_token
+    days = round(expires_in / 86400, 1) if expires_in else 60.0
+    expires_at = (now + timedelta(seconds=expires_in or 5184000)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    refreshed_at = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    _save_sheet_stored_token(new_token, expires_at)
+    secret_updated = _update_github_secret(new_token)
+
+    meta_out = {
+        "refreshed_at": refreshed_at,
+        "expires_at": expires_at,
+        "expires_in_days": days,
     }
-    sealed = _seal_for_github_secret(new_token)
-    if sealed:
-        meta_payload["sealed_for_github_actions"] = sealed
+    _save_meta(meta_out)
+    _commit_meta_if_ci()
 
-    META_FILE.write_text(json.dumps(meta_payload, indent=2) + "\n", encoding="utf-8")
-    _commit_and_push_meta()
-
-    print(
-        f"  ✅ [완료] THREADS_TOKEN 갱신 완료 "
-        f"(만료 예정: {meta_payload['expires_at']}, 약 {meta_payload['expires_in_days']}일)"
-    )
+    secret_msg = " + GitHub Secret 반영" if secret_updated else ""
+    print(f"  ✅ [완료] THREADS_TOKEN 갱신 완료 (만료 예정: {expires_at}, 약 {days}일{secret_msg})")
     return new_token
 
 
-def main() -> int:
-    token = (os.environ.get("THREADS_TOKEN") or "").strip()
+def refresh_token() -> None:
+    token = ensure_fresh_threads_token(force=True)
     if not token:
-        print("[오류] THREADS_TOKEN 환경변수가 비어 있습니다.", file=sys.stderr)
-        return 1
-    refreshed = ensure_fresh_threads_token(force=True)
-    if not refreshed:
-        return 1
-    return 0
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    refresh_token()
