@@ -1,202 +1,252 @@
 """
-그날의 남녀 - 블로거 자동 발행기
-'블로그용' 탭에서 Blog_Status='대기'인 행을 읽어
-Google Blogger API로 자동 발행하고 상태를 업데이트한다.
+그날의남녀 - Google Blogger 자동 발행 스크립트
+=============================================
+Google Sheets '블로그용' 시트에서 '대기' 상태인 글을 읽어
+Google Blogger에 자동으로 발행합니다.
+
+Blogger API v3 / AtomPub 인증 방식:
+  OAuth2 리프레시 토큰 사용 (YouTube와 동일한 패턴)
+  필요 환경변수:
+    - BLOGGER_CLIENT_ID
+    - BLOGGER_CLIENT_SECRET
+    - BLOGGER_REFRESH_TOKEN
+    - GOOGLE_SHEETS_CREDENTIALS (또는 GOOGLE_SERVICE_ACCOUNT)
 """
-import os, json, sys, time
+import json
+import os
+import re
+import time
+from xml.sax.saxutils import escape, quoteattr
+
 import requests
-import gspread
-from google.oauth2.service_account import Credentials
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 
 SHEET_ID = "1l7niiK9RbZwo_x0PI6T2vCqjIKn9c_gvxVrrKjwyo20"
-BLOG_SHEET_NAME = "블로그용"
-BLOG_HEADERS = ["Blog_Status", "EP", "제목", "HTML", "태그", "Video_URL", "Published_URL", "Published_At"]
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+BLOG_SHEET = "블로그용"
 
-# Blogger API 설정
-BLOGGER_SCOPES = ["https://www.googleapis.com/auth/blogger"]
+BLOGGER_TOKEN_URI = "https://oauth2.googleapis.com/token"
 BLOGGER_API_BASE = "https://www.googleapis.com/blogger/v3"
+TARGET_BLOG_ID = os.environ.get("BLOGGER_BLOG_ID", "2220812024604837629")
+TARGET_BLOG_HOST = "couplescore-auto.blogspot.com"
 
 
-def get_blogger_token():
-    """Blogger 전용 OAuth 토큰으로 접근"""
-    client_id = os.environ.get("BLOGGER_CLIENT_ID")
-    client_secret = os.environ.get("BLOGGER_CLIENT_SECRET")
+def get_sheets_service():
+    creds_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS") or os.environ.get("GOOGLE_SERVICE_ACCOUNT")
+    if not creds_json:
+        raise RuntimeError("GOOGLE_SHEETS_CREDENTIALS 환경변수가 설정되지 않았습니다.")
+    creds_info = json.loads(creds_json)
+    creds = service_account.Credentials.from_service_account_info(
+        creds_info,
+        scopes=["https://www.googleapis.com/auth/spreadsheets"],
+    )
+    return build("sheets", "v4", credentials=creds)
+
+
+def get_blogger_access_token():
+    """ OAuth2 리프레시 토큰으로 액세스 토큰 발급 """
+    client_id = os.environ.get("BLOGGER_CLIENT_ID") or os.environ.get("YT_CLIENT_ID")
+    client_secret = os.environ.get("BLOGGER_CLIENT_SECRET") or os.environ.get("YT_CLIENT_SECRET")
     refresh_token = os.environ.get("BLOGGER_REFRESH_TOKEN")
+
     if not all([client_id, client_secret, refresh_token]):
-        print("  ❌ Blogger OAuth 환경 변수 누락")
-        print("  → BLOGGER_CLIENT_ID, BLOGGER_CLIENT_SECRET, BLOGGER_REFRESH_TOKEN 필요")
-        return None
-    resp = requests.post("https://oauth2.googleapis.com/token", data={
-        "client_id": client_id, "client_secret": client_secret,
-        "refresh_token": refresh_token, "grant_type": "refresh_token"
-    })
-    if resp.status_code != 200:
-        print(f"  ❌ 토큰 갱신 실패: {resp.status_code}")
-        return None
+        raise RuntimeError(
+            "Blogger OAuth 환경변수가 부족합니다. "
+            "BLOGGER_CLIENT_ID, BLOGGER_CLIENT_SECRET, BLOGGER_REFRESH_TOKEN을 확인하세요."
+        )
+
+    resp = requests.post(
+        BLOGGER_TOKEN_URI,
+        data={
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "refresh_token": refresh_token,
+            "grant_type": "refresh_token",
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
     return resp.json()["access_token"]
 
 
 def get_blog_id(token):
-    """내 블로그 ID 조회"""
-    resp = requests.get(
-        f"{BLOGGER_API_BASE}/users/self/blogs",
-        headers={"Authorization": f"Bearer {token}"}
-    )
-    if resp.status_code != 200:
-        print(f"  ❌ 블로그 목록 조회 실패: {resp.status_code} {resp.text[:200]}")
-        return None, None
+    """ 그날의 남녀 (couplescore-auto.blogspot.com) 블로그 ID 조회 """
+    headers = {"Authorization": f"Bearer {token}"}
+    resp = requests.get(f"{BLOGGER_API_BASE}/users/self/blogs", headers=headers, timeout=30)
+    resp.raise_for_status()
     blogs = resp.json().get("items", [])
     if not blogs:
-        print("  ❌ 연결된 블로그가 없습니다.")
-        return None, None
-    blog = blogs[0]
-    blog_id = blog["id"]
-    blog_url = blog.get("url", "")
-    print(f"  블로그: {blog.get('name', 'unknown')} ({blog_url})")
-    return blog_id, blog_url
+        raise RuntimeError("연결된 Blogger 블로그가 없습니다. blogger.com에서 블로그를 먼저 생성하세요.")
+
+    blog = None
+    for b in blogs:
+        if (
+            str(b.get("id")) == str(TARGET_BLOG_ID)
+            or TARGET_BLOG_HOST in (b.get("url") or "")
+            or "그날의 남녀" in (b.get("name") or "")
+        ):
+            blog = b
+            break
+
+    if blog is None:
+        print(f"  ⚠️ 목록에서 대상 블로그를 찾지 못해 기본 ID({TARGET_BLOG_ID})를 사용합니다.")
+        return str(TARGET_BLOG_ID)
+
+    print(f"  블로그: {blog['name']} ({blog['url']})")
+    return blog["id"]
 
 
-def get_sheets_client():
-    creds_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS")
-    if not creds_json:
-        raise SystemExit("GOOGLE_SHEETS_CREDENTIALS 필요")
-    creds_dict = json.loads(creds_json)
-    creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
-    return gspread.authorize(creds)
-
-
-def find_pending_posts(ws):
-    """Blog_Status='대기'인 행 찾기"""
-    all_vals = ws.get_all_values()
-    pending = []
-    for i, row in enumerate(all_vals, start=1):
-        if i == 1:  # 헤더 스킵
-            continue
-        if row[0].strip() == "대기" and row[1].strip():
-            pending.append((i, row))
-    return pending
-
-
-def update_blog_status(ws, row_num, status, published_url=""):
-    """시트 상태 업데이트"""
-    from datetime import datetime
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    ws.update(range_name=f"A{row_num}:H{row_num}", values=[[
-        status,                     # Blog_Status
-        ws.cell(row_num, 2).value,  # EP
-        ws.cell(row_num, 3).value,  # 제목
-        ws.cell(row_num, 4).value,  # HTML
-        ws.cell(row_num, 5).value,  # 태그
-        ws.cell(row_num, 6).value,  # Video_URL
-        published_url,              # Published_URL
-        now,                        # Published_At
-    ]])
+def _extract_atom_url(xml_text):
+    m = re.search(
+        r"<link[^>]*rel=['\"]alternate['\"][^>]*href=['\"]([^'\"]+)['\"]",
+        xml_text or "",
+    )
+    if not m:
+        m = re.search(
+            r"<link[^>]*href=['\"]([^'\"]+)['\"][^>]*rel=['\"]alternate['\"]",
+            xml_text or "",
+        )
+    return m.group(1) if m else ""
 
 
 def publish_to_blogger(token, blog_id, title, html_content, tags):
-    """Blogger API로 포스팅"""
-    # 태그를 labels로 변환
-    labels = [t.strip() for t in tags.split(",") if t.strip()]
+    """ Blogger에 글 발행 (AtomPub API 우선, REST v3 폴백) """
+    raw_labels = [t.strip() for t in (tags or "").split(",") if t.strip()]
+    clean_labels = []
+    for t in raw_labels:
+        cleaned = re.sub(r"[&<>\"'/\\]", " ", t).strip()
+        if cleaned and cleaned not in clean_labels:
+            clean_labels.append(cleaned)
+    labels = clean_labels[:20]
 
-    payload = {
+    categories = "\n".join(
+        f"  <category scheme='http://www.blogger.com/atom/ns#' term={quoteattr(t)}/>"
+        for t in labels
+    )
+    safe_title = escape(title or "")
+    safe_html = (html_content or "").replace("]]>", "]]]]><![CDATA[>")
+
+    xml_body = f"""<?xml version='1.0' encoding='UTF-8'?>
+<entry xmlns='http://www.w3.org/2005/Atom'>
+  <title type='text'>{safe_title}</title>
+{categories}
+  <content type='html'><![CDATA[{safe_html}]]></content>
+</entry>"""
+
+    atom_headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/atom+xml; charset=utf-8",
+    }
+
+    resp = None
+    for attempt in range(3):
+        resp = requests.post(
+            f"https://www.blogger.com/feeds/{blog_id}/posts/default",
+            headers=atom_headers,
+            data=xml_body.encode("utf-8"),
+            timeout=60,
+        )
+
+        if resp.status_code in (200, 201):
+            url = _extract_atom_url(resp.text) or f"https://{TARGET_BLOG_HOST}/"
+            print(f"  ✅ 블로그 발행 완료! {url}")
+            return url
+        if resp.status_code == 429:
+            wait = 30 * (attempt + 1)
+            print(f"  ⏳ 쿼터 초과 (429), {wait}초 대기 후 재시도 ({attempt + 1}/3)...")
+            time.sleep(wait)
+            continue
+        break
+
+    # 폴백: REST v3 API
+    v3_headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    v3_body = {
         "kind": "blogger#post",
-        "blog": {"id": blog_id},
+        "blog": {"id": str(blog_id)},
         "title": title,
         "content": html_content,
         "labels": labels,
     }
-
-    resp = requests.post(
+    v3_resp = requests.post(
         f"{BLOGGER_API_BASE}/blogs/{blog_id}/posts",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
-        json=payload,
+        headers=v3_headers,
+        json=v3_body,
+        timeout=60,
     )
+    if v3_resp.status_code in (200, 201):
+        data = v3_resp.json()
+        url = data.get("url") or f"https://{TARGET_BLOG_HOST}/"
+        print(f"  ✅ 블로그 발행 완료 (v3)! {url}")
+        return url
 
-    if resp.status_code in (200, 201):
-        post_data = resp.json()
-        post_url = post_data.get("url", "")
-        post_id = post_data.get("id", "")
-        print(f"  ✅ 발행 완료: {post_url}")
-        return post_url
-    else:
-        print(f"  ❌ 발행 실패 ({resp.status_code}): {resp.text[:300]}")
-        if resp.status_code == 401:
-            print("  → 토큰 만료. YouTube OAuth 토큰을 다시 생성하세요.")
-        elif resp.status_code == 403:
-            print("  → Blogger API 권한이 없습니다.")
-            print("  → Google Cloud Console에서 Blogger API를 활성화하세요.")
-        elif resp.status_code == 400:
-            print("  → 요청 데이터가 올바르지 않습니다.")
-        return None
+    atom_status = resp.status_code if resp is not None else "N/A"
+    atom_err = re.sub(r"[{}\[\]]", "", (resp.text[:250] if resp is not None else "")).strip()
+    v3_err = re.sub(r"[{}\[\]]", "", v3_resp.text[:250]).strip()
+    print(f"  ❌ 발행 실패 (AtomPub {atom_status}: {atom_err} | v3 {v3_resp.status_code}: {v3_err})")
+    return None
 
 
 def main():
-    print("=" * 50)
-    print("그날의남녀 - 블로거 자동 발행기")
-    print("=" * 50)
+    """ '블로그용' 시트에서 대기 상태인 글을 모두 발행 """
+    print("=" * 60)
+    print("Blogger 자동 발행 시작")
+    print("=" * 60)
 
-    # 토큰 확인
-    token = get_blogger_token()
-    if not token:
-        print("❌ Blogger 인증 실패")
-        sys.exit(1)
+    service = get_sheets_service()
+    blogger_token = get_blogger_access_token()
+    blog_id = get_blog_id(blogger_token)
 
-    # 블로그 ID 조회
-    blog_id, blog_url = get_blog_id(token)
-    if not blog_id:
-        print("❌ 블로그 ID 조회 실패")
-        sys.exit(1)
+    result = service.spreadsheets().values().get(
+        spreadsheetId=SHEET_ID,
+        range=f"'{BLOG_SHEET}'!A:G",
+    ).execute()
+    rows = result.get("values", [])
 
-    # 시트 연결
-    gc = get_sheets_client()
-    sh = gc.open_by_key(SHEET_ID)
-    try:
-        ws = sh.worksheet(BLOG_SHEET_NAME)
-    except gspread.exceptions.WorksheetNotFound:
-        print(f"❌ '{BLOG_SHEET_NAME}' 탭이 없습니다.")
-        print("  → generate_blog_content.py를 먼저 실행하세요.")
-        sys.exit(1)
-
-    # 대기 포스팅 찾기
-    pending = find_pending_posts(ws)
-    if not pending:
-        print("⚠ 발행 대기 포스팅 없음. 건너뜀.")
+    if len(rows) <= 1:
+        print("발행 대기 중인 글이 없습니다.")
         return
 
-    print(f"발행 대기: {len(pending)}건")
+    published_count = 0
+    for i, row in enumerate(rows[1:], start=2):
+        while len(row) < 7:
+            row.append("")
 
-    success_count = 0
-    for row_num, row_data in pending:
-        ep = row_data[1]
-        title = row_data[2]
-        html = row_data[3]
-        tags = row_data[4]
-        video_url = row_data[5]
+        ep_num, topic, title, html_content, status, blog_url, summary = row[:7]
 
-        print(f"\n--- EP.{ep}: {title} ---")
+        if status != "대기":
+            continue
 
-        # Video_URL 업데이트 (YouTube에서 가져온 경우)
-        if video_url and not html:
-            print(f"  Video URL: {video_url}")
+        if not title or not html_content:
+            print(f"[{ep_num}] 제목 또는 본문이 비어있어 건너뜁니다.")
+            continue
 
-        # 발행
-        post_url = publish_to_blogger(token, blog_id, title, html, tags)
-        if post_url:
-            update_blog_status(ws, row_num, "발행완료", post_url)
-            success_count += 1
+        print(f"\n[{ep_num}] '{title}' 발행 중...")
+
+        tags = f"커플,연애,그날의남녀,{topic}"
+        url = publish_to_blogger(blogger_token, blog_id, title, html_content, tags)
+
+        if url:
+            service.spreadsheets().values().update(
+                spreadsheetId=SHEET_ID,
+                range=f"'{BLOG_SHEET}'!E{i}:F{i}",
+                valueInputOption="RAW",
+                body={"values": [["발행완료", url]]},
+            ).execute()
+            published_count += 1
+            print(f"  시트 업데이트 완료 (행 {i})")
+            time.sleep(2)
         else:
-            update_blog_status(ws, row_num, "발행실패")
-            print(f"  ❌ EP.{ep} 발행 실패")
+            service.spreadsheets().values().update(
+                spreadsheetId=SHEET_ID,
+                range=f"'{BLOG_SHEET}'!E{i}",
+                valueInputOption="RAW",
+                body={"values": [["발행실패"]]},
+            ).execute()
 
-        time.sleep(1)  # API rate limit 방지
-
-    print(f"\n{'='*50}")
-    print(f"발행 결과: {success_count}/{len(pending)}건 성공")
-    print(f"{'='*50}")
+    print(f"\n완료! 총 {published_count}개 글이 발행되었습니다.")
 
 
 if __name__ == "__main__":
