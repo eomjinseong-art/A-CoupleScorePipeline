@@ -1,0 +1,9 @@
+{
+  "refreshed_at": "2026-10-26T01:37:01Z",
+  "expires_at": "2026-12-25T01:37:01Z",
+  "expires_in_days": 60.0,
+  "sealed_for_github_actions": {
+    "key_id": "3380204578043523366",
+    "encrypted_value": "6J/kQ3971Cmy3Q6AGoSO8dQw8TJiyD5OE7AexEpI6RhQSMKkwG3ThiZKtIEq6qZavgyUe4rXyKZ07rt0SjFzlfyDIhh56/P9uCqt15JNTtEEefnDuC2DeeoCwoSxO+MBk6rwYibwLhMo9HQYZrau3p2xjfACAi6w1OtqPqrAkX+MUEQB3vm9VKmVRR2j/kiXl5snx4CUdXvgjGRmhevTexBuOITrPouW7nPWOBU2XcIFTe0LU53+Hp+fv18UBYVNR6uEkFlbiT/h22d/7+ocyYWrTVrkOhiHWq6mVVw96S1ooTirSvz80xdu"
+  }
+}
