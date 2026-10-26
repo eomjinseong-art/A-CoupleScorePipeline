@@ -553,6 +553,16 @@ def run(argv=None):
     print("그날의 남녀 - 자동화 파이프라인")
     print("=" * 50)
 
+    if not dry_run:
+        try:
+            from scripts.refresh_token import ensure_fresh_threads_token
+            refreshed_token = ensure_fresh_threads_token()
+            if refreshed_token:
+                global THREADS_TOKEN
+                THREADS_TOKEN = refreshed_token
+        except Exception as e:
+            print(f"  [경고] Threads 토큰 자동 연장 점검 중 오류: {e}")
+
     ep = fetch_queue_episode(index) or fetch_next_episode()
     if not ep:
         print("\n⚠ 처리할 에피소드가 없습니다. 다음 실행을 기다립니다.")
@@ -604,46 +614,73 @@ def run(argv=None):
         from generate_blog_content import generate_blog_post, get_or_create_blog_sheet, find_next_row, load_client as load_blog_client
         from publish_blogger import get_blogger_token, get_blog_id, publish_to_blogger, get_sheets_client
 
-        print("[8/9] 블로그 콘텐츠 생성 중...")
-        blog_data = generate_blog_post(ep)
-        if blog_data:
-            # 시트에 기록
-            gc = load_blog_client()
-            ws = get_or_create_blog_sheet(gc)
-            next_row = find_next_row(ws)
-            ep_num = ep["ep"].replace("EP.", "").replace("ep.", "").strip()
-            row_data = [
-                "대기", ep_num, blog_data["title"], blog_data["html"],
-                ",".join(blog_data["tags"]),
-                f"https://youtube.com/shorts/{yt_id}" if yt_id else "",
-                "", ""
-            ]
-            ws.update(range_name=f"A{next_row}:H{next_row}", values=[row_data])
-            print(f"  블로그 콘텐츠 기록 완료: {blog_data['title']}")
+        gc = load_blog_client()
+        ws = get_or_create_blog_sheet(gc)
+        ep_num = ep["ep"].replace("EP.", "").replace("ep.", "").strip()
 
-            # Blogger 발행
-            print("[9/9] 블로거 발행 중...")
-            token = get_blogger_token()
-            if token:
-                blog_id, _ = get_blog_id(token)
-                if blog_id:
-                    post_url = publish_to_blogger(
-                        token, blog_id, blog_data["title"],
-                        blog_data["html"], ",".join(blog_data["tags"])
-                    )
-                    if post_url:
-                        blog_ok = True
-                        from datetime import datetime
-                        ws.update(range_name=f"A{next_row}:H{next_row}", values=[[
-                            "발행완료", ep_num, blog_data["title"], blog_data["html"],
-                            ",".join(blog_data["tags"]),
-                            f"https://youtube.com/shorts/{yt_id}" if yt_id else "",
-                            post_url, datetime.now().strftime("%Y-%m-%d %H:%M")
-                        ]])
-                else:
-                    print("  ❌ 블로그 ID 조회 실패")
+        existing_row = None
+        already_published_url = None
+        blog_data = None
+        for r_idx, r_val in enumerate(ws.get_all_values(), start=1):
+            if r_idx == 1 or len(r_val) < 2:
+                continue
+            if r_val[1].strip() == ep_num:
+                r_status = r_val[0].strip()
+                if r_status == "발행완료":
+                    already_published_url = r_val[6].strip() if len(r_val) > 6 else ""
+                    break
+                elif len(r_val) >= 5 and r_val[2].strip() and r_val[3].strip():
+                    existing_row = r_idx
+                    blog_data = {
+                        "title": r_val[2].strip(),
+                        "html": r_val[3],
+                        "tags": [t.strip() for t in r_val[4].split(",") if t.strip()],
+                    }
+
+        if already_published_url is not None:
+            print(f"[8/9] ⏭ 에피소드 {ep_num}는 이미 블로그에 발행됨 ({already_published_url})")
+            blog_ok = True
+        else:
+            if blog_data and existing_row:
+                next_row = existing_row
+                print(f"[8/9] 📋 기존 블로그 대기 콘텐츠 재사용 (행 {next_row}): {blog_data['title']}")
             else:
-                print("  ❌ Blogger 토큰 갱신 실패")
+                print("[8/9] 블로그 콘텐츠 생성 중...")
+                blog_data = generate_blog_post(ep)
+                if blog_data:
+                    next_row = find_next_row(ws)
+                    row_data = [
+                        "대기", ep_num, blog_data["title"], blog_data["html"],
+                        ",".join(blog_data["tags"]),
+                        f"https://youtube.com/shorts/{yt_id}" if yt_id else "",
+                        "", ""
+                    ]
+                    ws.update(range_name=f"A{next_row}:H{next_row}", values=[row_data])
+                    print(f"  블로그 콘텐츠 기록 완료: {blog_data['title']}")
+
+            if blog_data:
+                print("[9/9] 블로거 발행 중...")
+                token = get_blogger_token()
+                if token:
+                    blog_id, _ = get_blog_id(token)
+                    if blog_id:
+                        post_url = publish_to_blogger(
+                            token, blog_id, blog_data["title"],
+                            blog_data["html"], ",".join(blog_data["tags"])
+                        )
+                        if post_url:
+                            blog_ok = True
+                            from datetime import datetime
+                            ws.update(range_name=f"A{next_row}:H{next_row}", values=[[
+                                "발행완료", ep_num, blog_data["title"], blog_data["html"],
+                                ",".join(blog_data["tags"]),
+                                f"https://youtube.com/shorts/{yt_id}" if yt_id else "",
+                                post_url, datetime.now().strftime("%Y-%m-%d %H:%M")
+                            ]])
+                    else:
+                        print("  ❌ 블로그 ID 조회 실패")
+                else:
+                    print("  ❌ Blogger 토큰 갱신 실패")
     except Exception as e:
         print(f"  ❌ 블로그 발행 중 오류: {e}")
 
