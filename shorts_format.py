@@ -23,7 +23,15 @@ DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 OVERRIDES_CSV = os.path.join(DATA_DIR, "ep078_107_overrides.csv")
 TOPICS_CSV = os.path.join(DATA_DIR, "topics_n01_n20.csv")
 
-# 남성은 낮고 느리게, 여성은 높고 또렷하게. 같은 성우를 쓰지 않는다.
+# 예약 실행의 기본 음성. 남녀 대사는 voice="male"/"female"로 그대로 두고 여기서만 성우를 고른다.
+# 순서는 main.gen_tts: edge-tts → gTTS → Google Cloud TTS → OpenAI TTS.
+EDGE_VOICES = {"male": "ko-KR-InJoonNeural", "female": "ko-KR-SunHiNeural"}
+EDGE_TTS_RATE = "+20%"
+EDGE_TTS_PITCH = {"male": "-4Hz", "female": "+4Hz"}
+# 첫 실패 후 1초, 2초, 4초. 네 번째 실패에서 gTTS로 넘긴다.
+EDGE_RETRY_BACKOFF_SECONDS = (1, 2, 4)
+
+# OpenAI TTS는 키가 있을 때만 최후 폴백.
 OPENAI_TTS_MODEL = "gpt-4o-mini-tts"
 OPENAI_TTS_SPEED = 1.2
 OPENAI_VOICES = {"male": "cedar", "female": "marin"}

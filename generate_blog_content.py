@@ -1,13 +1,15 @@
 """
-그날의 남녀 - 블로그 콘텐츠 생성기
-메인 시트의 대본을 읽어 OpenAI로 티스토리/블로거용 HTML 포스팅을 생성하고
-'블로그용' 탭에 기록한다.
+그날의 남녀 - 블로그 콘텐츠
+
+예약 파이프라인은 render_blog_post()로 큐 원문을 HTML로 옮긴다. LLM을 호출하지 않는다.
+이 파일을 직접 실행할 때만 generate_blog_post()가 Gemini(우선) 또는 OpenAI로 초안을 만든다.
 """
+import html
 import os, json, sys, csv, io
 import requests
-import gspread
-from google.oauth2.service_account import Credentials
-from openai import OpenAI
+
+from llm_client import chat_completion, completion_text, parse_json_content
+from reconcile import SHOP_LINE
 
 SHEET_ID = "1l7niiK9RbZwo_x0PI6T2vCqjIKn9c_gvxVrrKjwyo20"
 SHEET_CSV_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid=0"
@@ -67,6 +69,9 @@ def get_blogger_credentials():
 
 
 def load_client():
+    import gspread
+    from google.oauth2.service_account import Credentials
+
     creds_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS")
     if not creds_json:
         raise SystemExit("GOOGLE_SHEETS_CREDENTIALS 환경변수가 필요합니다.")
@@ -98,6 +103,8 @@ def fetch_pending_episode():
 
 def get_or_create_blog_sheet(gc):
     """'블로그용' 탭 가져오기 또는 생성"""
+    import gspread
+
     sh = gc.open_by_key(SHEET_ID)
     try:
         ws = sh.worksheet(BLOG_SHEET_NAME)
@@ -124,14 +131,66 @@ def find_next_row(ws):
     return len(all_vals) + 1
 
 
-def generate_blog_post(ep):
-    """OpenAI GPT로 블로그 포스팅 HTML 생성"""
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        print("  ❌ OPENAI_API_KEY 없음")
-        return None
+def _paragraphs(text):
+    lines = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if line:
+            lines.append(f"<p>{html.escape(line)}</p>")
+    return "\n".join(lines)
 
-    client = OpenAI(api_key=api_key)
+
+def _blog_title(ep):
+    title = " ".join((ep.get("hook") or ep.get("topic") or "그날의 남녀").split())
+    if len(title) > 80:
+        title = title[:79].rstrip() + "…"
+    return title
+
+
+def _blog_tags(ep):
+    raw = ["그날의남녀", "커플화해", "화해썰", "연애심리", ep.get("topic") or ""]
+    tags = []
+    for tag in raw:
+        tag = " ".join(str(tag).replace(",", " ").split())
+        if tag and tag not in tags:
+            tags.append(tag)
+    return tags[:5]
+
+
+def render_blog_post(ep):
+    """큐·시트 원문으로 블로그 HTML을 만든다. 네트워크와 LLM을 쓰지 않는다."""
+    parts = [f"<p><strong>{html.escape(_blog_title(ep))}</strong></p>"]
+    fight = (ep.get("fight") or "").strip()
+    makeup = (ep.get("makeup") or "").strip()
+    if fight or makeup:
+        if fight:
+            parts.append("<h2>싸운 이유</h2>")
+            parts.append(_paragraphs(fight))
+        if makeup:
+            parts.append("<h2>이렇게 화해했어요</h2>")
+            parts.append(_paragraphs(makeup))
+    else:
+        script = (ep.get("script") or "").strip()
+        if script:
+            parts.append("<h2>사연</h2>")
+            parts.append(_paragraphs(script))
+    warm = (ep.get("psychology") or ep.get("warm") or "").strip()
+    if warm:
+        parts.append("<h2>오늘의 화해</h2>")
+        parts.append(f"<p><strong>{html.escape(warm)}</strong></p>")
+    outfit = (ep.get("outfit") or "").strip()
+    if outfit:
+        parts.append(f"<p>그날 입은 옷: {html.escape(outfit)}</p>")
+    if ep.get("shop"):
+        parts.append(f"<p>{html.escape(SHOP_LINE)}</p>")
+    question = (ep.get("question") or "여러분은 어떻게 화해해요?").strip()
+    parts.append(f"<h2>{html.escape(question)}</h2>")
+    parts.append("<p>댓글로 여러분만의 화해법을 알려 주세요.</p>")
+    return {"title": _blog_title(ep), "html": "\n".join(parts), "tags": _blog_tags(ep)}
+
+
+def generate_blog_post(ep):
+    """수동 실행 전용. Gemini를 우선하고, 키가 없으면 OpenAI를 쓴다."""
     user_prompt = (
         f"화자: {ep['gender']}\n"
         f"주제: {ep['topic']}\n"
@@ -139,25 +198,27 @@ def generate_blog_post(ep):
         f"마무리 질문: {ep['question']}\n\n"
         f"위 사연을 블로그 포스팅용 HTML로 변환해주세요."
     )
-
-    print(f"  OpenAI GPT 호출 중... (EP.{ep['ep']})")
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
+    system = RECONCILE_SYSTEM_PROMPT if ep.get("source") == "reconcile" else SYSTEM_PROMPT
+    print(f"  LLM으로 블로그 초안 생성 (Gemini 우선, EP.{ep.get('ep', '')})")
+    resp, spec = chat_completion(
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_prompt},
+        ],
         max_tokens=4000,
         temperature=0.7,
-        messages=[
-            {"role": "system", "content": RECONCILE_SYSTEM_PROMPT if ep.get("source") == "reconcile" else SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt}
-        ],
+        response_format={"type": "json_object"},
     )
-
-    raw = response.choices[0].message.content
-    raw = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-
+    if resp is None:
+        print("  ❌ GEMINI_API_KEY(우선) 또는 OPENAI_API_KEY 없음")
+        return None
+    if resp.status_code != 200:
+        print(f"  ❌ LLM 오류 ({spec['provider']} {spec['model']}): {resp.status_code} {resp.text[:200]}")
+        return None
     try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        print(f"  ❌ JSON 파싱 실패: {raw[:200]}")
+        data = parse_json_content(completion_text(resp))
+    except (KeyError, IndexError, TypeError, json.JSONDecodeError, ValueError) as exc:
+        print(f"  ❌ JSON 파싱 실패: {exc}")
         return None
 
     required = ["title", "html", "tags"]

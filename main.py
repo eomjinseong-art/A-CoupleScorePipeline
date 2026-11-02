@@ -2,12 +2,17 @@
 그날의 남녀 - 일일 자동화 파이프라인 (GitHub Actions용)
 전체 흐름: Google Sheets에서 대본 읽기 → 영상 생성 → YouTube 업로드 → Threads 포스팅 → 블로그 발행
 """
+import asyncio
 import os, json, time, base64, subprocess, sys, shutil, csv, io
 import requests
 from PIL import ImageDraw
 
 from shorts_format import (
     AUDIO_CONFIGS,
+    EDGE_RETRY_BACKOFF_SECONDS,
+    EDGE_TTS_PITCH,
+    EDGE_TTS_RATE,
+    EDGE_VOICES,
     OPENAI_TTS_INSTRUCTIONS,
     OPENAI_TTS_MODEL,
     OPENAI_TTS_SPEED,
@@ -29,7 +34,7 @@ from shorts_format import (
 import reconcile
 
 # === 환경 변수 ===
-GCP_TTS_KEY = os.environ.get("GCP_TTS_KEY")
+# GCP_TTS_KEY, OPENAI_API_KEY 는 TTS가 호출 시점에 읽는다. 없으면 그 단계는 건너뛴다.
 YT_CLIENT_ID = os.environ.get("YT_CLIENT_ID")
 YT_CLIENT_SECRET = os.environ.get("YT_CLIENT_SECRET")
 YT_REFRESH_TOKEN = os.environ.get("YT_REFRESH_TOKEN")
@@ -43,7 +48,6 @@ WORK_DIR = "/tmp/couple_render"
 SHEET_ID = "1l7niiK9RbZwo_x0PI6T2vCqjIKn9c_gvxVrrKjwyo20"
 SHEET_CSV_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid=0"
 
-TTS_URL = f"https://texttospeech.googleapis.com/v1/text:synthesize?key={GCP_TTS_KEY}"
 SAMPLE_RATE = 44100
 W, H = 1080, 1920
 BG = (0, 0, 0)
@@ -57,8 +61,8 @@ RED = (255, 90, 90)
 # ===== Google Sheets 읽기 =====
 
 def fetch_queue_episode(index=None):
-    """'우리 오늘 화해했어요' 큐(data/reconcile_episodes.json)를 시트보다 먼저 쓴다."""
-    if (os.environ.get("RECONCILE_QUEUE") or "on").strip().lower() in ("0", "off", "false", "no"):
+    """예약 실행은 data/reconcile_episodes.json 만 읽는다. 비어 있으면 None."""
+    if not reconcile.queue_enabled():
         return None
     queue = reconcile.load_queue()
     idx = reconcile.slot_index() if index is None else index
@@ -66,9 +70,9 @@ def fetch_queue_episode(index=None):
     if ep:
         print(f"[1/7] 화해 큐 사용: 슬롯 {idx} / {len(queue)}개 → {ep['ep']} ({ep['speaker_ko']}) - {ep['topic']}")
         print(f"  훅: {ep['hook']}")
-    else:
-        print(f"[1/7] 화해 큐 범위 밖 (슬롯 {idx} / {len(queue)}개) → 시트로 돌아갑니다.")
-    return ep
+        return ep
+    print(f"::warning::큐가 비었습니다. 슬롯 {idx} / {len(queue)}개. OpenAI를 호출하지 않고 이번 실행을 건너뜁니다.")
+    return None
 
 
 def fetch_next_episode():
@@ -204,48 +208,91 @@ def num_to_korean(text):
     for k, v in char_map.items(): text = text.replace(k, v)
     return text
 
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 OPENAI_TTS_URL = "https://api.openai.com/v1/audio/speech"
 
 
 def _write_resampled(audio_bytes, out):
+    if not audio_bytes:
+        return False
     raw = out + ".raw"
     with open(raw, "wb") as f:
         f.write(audio_bytes)
     r = subprocess.run(["ffmpeg", "-y", "-i", raw, "-ar", str(SAMPLE_RATE), "-ac", "1", out], capture_output=True)
     os.remove(raw)
-    return r.returncode == 0 and os.path.exists(out)
+    return r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0
 
 
-def _gen_tts_openai(text, gender, out):
-    if not OPENAI_API_KEY:
-        print("  ⚠️ OPENAI_API_KEY 없음 → Google TTS 사용")
-        return False
+def _edge_synthesize(text, voice, rate, pitch, dest):
+    import edge_tts
+
+    async def _run():
+        communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
+        await communicate.save(dest)
+
+    asyncio.run(_run())
+
+
+def _gen_tts_edge(text, gender, out, sleep=time.sleep):
+    """edge-tts. 실패하면 1초, 2초, 4초 뒤 재시도하고, 그래도 안 되면 False."""
+    voice = EDGE_VOICES[gender]
+    pitch = EDGE_TTS_PITCH[gender]
+    tmp = out + ".edge.mp3"
+    attempts = len(EDGE_RETRY_BACKOFF_SECONDS) + 1
+    for attempt in range(attempts):
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            _edge_synthesize(text, voice, EDGE_TTS_RATE, pitch, tmp)
+            if not os.path.exists(tmp) or os.path.getsize(tmp) < 100:
+                raise RuntimeError("edge-tts 출력이 비었습니다")
+            with open(tmp, "rb") as fh:
+                audio = fh.read()
+            if _write_resampled(audio, out):
+                print(f"  edge-tts ({voice}, rate {EDGE_TTS_RATE}, pitch {pitch})")
+                return True
+            raise RuntimeError("edge-tts 오디오 변환 실패")
+        except Exception as exc:
+            if attempt >= len(EDGE_RETRY_BACKOFF_SECONDS):
+                print(f"  ⚠️ edge-tts 실패 → gTTS/Google TTS: {exc}")
+                return False
+            wait = EDGE_RETRY_BACKOFF_SECONDS[attempt]
+            print(f"  edge-tts 실패, {wait}초 후 재시도 ({attempt + 1}회차): {exc}")
+            sleep(wait)
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+    return False
+
+
+def _gen_tts_gtts(text, gender, out):
     try:
-        resp = requests.post(OPENAI_TTS_URL, headers={"Authorization": f"Bearer {OPENAI_API_KEY}"}, json={
-            "model": OPENAI_TTS_MODEL, "voice": OPENAI_VOICES[gender], "input": text,
-            "instructions": OPENAI_TTS_INSTRUCTIONS[gender], "speed": OPENAI_TTS_SPEED,
-            "response_format": "mp3",
-        }, timeout=120)
-    except Exception as e:
-        print(f"  ⚠️ OpenAI TTS 오류: {e} → Google TTS 사용")
+        from gtts import gTTS
+        buf = io.BytesIO()
+        gTTS(text=text, lang="ko").write_to_fp(buf)
+        audio = buf.getvalue()
+    except Exception as exc:
+        print(f"  ⚠️ gTTS 실패: {exc}")
         return False
-    if resp.status_code == 200 and resp.content and _write_resampled(resp.content, out):
+    if audio and _write_resampled(audio, out):
+        print(f"  gTTS로 음성을 만들었습니다 ({gender} 대사를 ko 단일 음성으로 읽음).")
         return True
-    print(f"  ⚠️ OpenAI TTS 실패 ({resp.status_code}): {resp.text[:200]} → Google TTS 사용")
+    print("  ⚠️ gTTS 오디오 변환 실패")
     return False
 
 
 def _gen_tts_google(text, gender, out):
-    if not GCP_TTS_KEY:
-        print("  ❌ GCP_TTS_KEY 환경 변수가 없습니다.")
+    key = (os.environ.get("GCP_TTS_KEY") or "").strip()
+    if not key:
+        print("  GCP_TTS_KEY 없음 → Google Cloud TTS 생략")
         return False
-    resp = requests.post(TTS_URL, json={
-        "input": {"text": text}, "voice": VOICES[gender], "audioConfig": AUDIO_CONFIGS[gender]
-    })
+    resp = requests.post(
+        f"https://texttospeech.googleapis.com/v1/text:synthesize?key={key}",
+        json={"input": {"text": text}, "voice": VOICES[gender], "audioConfig": AUDIO_CONFIGS[gender]},
+        timeout=60,
+    )
     if resp.status_code == 200:
         return _write_resampled(base64.b64decode(resp.json()["audioContent"]), out)
-    print(f"  ❌ TTS 실패 ({resp.status_code}): {resp.text[:200]}")
+    print(f"  ⚠️ Google Cloud TTS 실패 ({resp.status_code}): {resp.text[:200]}")
     if resp.status_code == 403:
         print("  → GCP TTS API 키가 유효하지 않거나 quota가 초과되었습니다.")
     elif resp.status_code == 400:
@@ -253,12 +300,40 @@ def _gen_tts_google(text, gender, out):
     return False
 
 
-def gen_tts(text, gender, out):
-    """OpenAI gpt-4o-mini-tts (cedar/marin, speed 1.2) 우선, 실패 시 Google TTS."""
+def _gen_tts_openai(text, gender, out):
+    key = (os.environ.get("OPENAI_API_KEY") or "").strip()
+    if not key:
+        print("  OPENAI_API_KEY 없음 → OpenAI TTS 생략")
+        return False
+    try:
+        resp = requests.post(OPENAI_TTS_URL, headers={"Authorization": f"Bearer {key}"}, json={
+            "model": OPENAI_TTS_MODEL, "voice": OPENAI_VOICES[gender], "input": text,
+            "instructions": OPENAI_TTS_INSTRUCTIONS[gender], "speed": OPENAI_TTS_SPEED,
+            "response_format": "mp3",
+        }, timeout=120)
+    except Exception as e:
+        print(f"  ⚠️ OpenAI TTS 오류: {e}")
+        return False
+    if resp.status_code == 200 and resp.content and _write_resampled(resp.content, out):
+        print(f"  OpenAI TTS 최후 폴백 ({OPENAI_VOICES[gender]})")
+        return True
+    print(f"  ⚠️ OpenAI TTS 실패 ({resp.status_code}): {resp.text[:200]}")
+    return False
+
+
+def gen_tts(text, gender, out, sleep=time.sleep):
+    """edge-tts 기본. 실패 시 gTTS, Google Cloud TTS, 마지막에만 OpenAI TTS."""
     text = num_to_korean(text)
+    if _gen_tts_edge(text, gender, out, sleep=sleep):
+        return True
+    if _gen_tts_gtts(text, gender, out):
+        return True
+    if _gen_tts_google(text, gender, out):
+        return True
     if _gen_tts_openai(text, gender, out):
         return True
-    return _gen_tts_google(text, gender, out)
+    print("  ❌ TTS 전부 실패 (edge-tts, gTTS, Google Cloud TTS, OpenAI TTS)")
+    return False
 
 def get_dur(p):
     return float(subprocess.check_output([
@@ -563,10 +638,15 @@ def run(argv=None):
         except Exception as e:
             print(f"  [경고] Threads 토큰 자동 연장 점검 중 오류: {e}")
 
-    ep = fetch_queue_episode(index) or fetch_next_episode()
-    if not ep:
-        print("\n⚠ 처리할 에피소드가 없습니다. 다음 실행을 기다립니다.")
-        return 1
+    if reconcile.queue_enabled():
+        ep = fetch_queue_episode(index)
+        if ep is None:
+            return 0
+    else:
+        ep = fetch_next_episode()
+        if not ep:
+            print("\n⚠ 처리할 에피소드가 없습니다. 다음 실행을 기다립니다.")
+            return 1
 
     from_queue = ep.get("source") == "reconcile"
     if from_queue:
@@ -611,7 +691,7 @@ def run(argv=None):
     # 6. 블로그 콘텐츠 생성 + 발행
     blog_ok = False
     try:
-        from generate_blog_content import generate_blog_post, get_or_create_blog_sheet, find_next_row, load_client as load_blog_client
+        from generate_blog_content import render_blog_post, get_or_create_blog_sheet, find_next_row, load_client as load_blog_client
         from publish_blogger import get_blogger_token, get_blog_id, publish_to_blogger, get_sheets_client
 
         gc = load_blog_client()
@@ -645,8 +725,8 @@ def run(argv=None):
                 next_row = existing_row
                 print(f"[8/9] 📋 기존 블로그 대기 콘텐츠 재사용 (행 {next_row}): {blog_data['title']}")
             else:
-                print("[8/9] 블로그 콘텐츠 생성 중...")
-                blog_data = generate_blog_post(ep)
+                print("[8/9] 블로그 HTML 작성 중 (LLM 호출 없음)...")
+                blog_data = render_blog_post(ep)
                 if blog_data:
                     next_row = find_next_row(ws)
                     row_data = [
