@@ -35,6 +35,7 @@ class WorkflowContractTests(unittest.TestCase):
             text = fh.read()
         self.assertIn("workflow_dispatch", text)
         self.assertIn("cron:", text)
+        self.assertNotIn("push:", text)
         self.assertIn("secrets.GH_PAT", text)
         self.assertIn("secrets.SECRETS_WRITE_TOKEN", text)
         self.assertIn("secrets.THREADS_TOKEN", text)
