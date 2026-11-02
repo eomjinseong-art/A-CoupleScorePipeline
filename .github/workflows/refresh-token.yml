@@ -1,0 +1,72 @@
+name: Threads 토큰 자동 연장
+
+# 매주 월요일 10:41 KST. 장기 토큰(60일)을 만료 전에 연장하고
+# THREADS_TOKEN 시크릿에 다시 쓴다. 실패하면 이슈 'Threads 토큰 갱신 실패'.
+# 토큰 값은 로그에 남기지 않는다.
+on:
+  schedule:
+    - cron: "41 1 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: threads-token-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 20
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests gspread google-auth
+
+      - name: Refresh Threads long-lived token
+        env:
+          THREADS_TOKEN: ${{ secrets.THREADS_TOKEN }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          SECRETS_WRITE_TOKEN: ${{ secrets.SECRETS_WRITE_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+        run: python scripts/refresh_token.py
+
+      - name: 갱신 실패 이슈
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/refresh_token.py --alert-only
+
+      - name: 만료 기록 커밋
+        if: success()
+        run: |
+          git add data/threads_token.json
+          if git diff --cached --quiet; then
+            echo "변경 없음"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore: record Threads token expiry [skip ci]"
+          pushed=0
+          for i in 1 2 3; do
+            if git pull --rebase && git push; then
+              pushed=1
+              break
+            fi
+            git rebase --abort >/dev/null 2>&1 || true
+            sleep 5
+          done
+          if [ "$pushed" -ne 1 ]; then
+            echo "::warning::만료 기록 푸시에 실패했습니다. 시크릿 갱신 결과는 이 로그의 expires_at 입니다."
+          fi

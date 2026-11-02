@@ -6,7 +6,7 @@
 1. 예약 슬롯에 해당하는 `data/reconcile_episodes.json` 항목을 고른다. 큐가 비면 로그만 남기고 건너뛴다
 2. 시트 원문은 바꾸지 않는다. 큐 회차는 시트 Status도 바꾸지 않는다
 3. 첫 장면은 갈등 한 줄. 남자·여자 목소리를 나누고, 끝은 화해 한 줄과 질문
-4. edge-tts로 음성 생성 (실패 시 gTTS → Google Cloud TTS → OpenAI TTS)
+4. edge-tts로 음성 생성 (실패 시 gTTS). 워크플로는 유료 TTS 키를 넣지 않는다
 5. 자막은 쇼츠 안전 영역(상단 검색, 우측 버튼, 하단 제목 밖)에 그림
 6. YouTube는 21:00 KST에만 1편. 제목은 갈등으로 시작하고 채널명·EP는 끝에 둠
 7. Threads·블로그는 09:00과 21:00 KST. 대본 전문은 유지
@@ -35,7 +35,9 @@
 ## 실행 시간
 - 매일 한국 시간 09:00: Threads + 블로그 (YouTube 없음)
 - 매일 한국 시간 21:00: YouTube Short 1편 + Threads + 블로그
-- 예약 실행은 LLM으로 대본을 만들지 않는다. 큐는 `data/reconcile_episodes.json`에 직접 채운다. 수동 생성만 `python generate_episodes.py`이며 `GEMINI_API_KEY`(gemini-2.5-flash)를 우선한다.
+- 예약 실행은 LLM으로 대본을 만들지 않는다. 큐는 `data/reconcile_episodes.json`에 직접 채운다. 블로그 HTML도 그 큐를 템플릿에 넣어 만든다. 수동 생성만 `python generate_episodes.py`이며, 그 키는 Actions에 넣지 않는다.
+- Threads 장기 토큰은 매주 월요일 `.github/workflows/refresh-token.yml`이 연장하고 `THREADS_TOKEN` 시크릿에 다시 쓴다. 실패하면 이슈 `Threads 토큰 갱신 실패`.
+- YouTube·Blogger 갱신이 `invalid_grant`이면 이슈 `구글 로그인 다시 필요`. 큐가 14일 미만이면 이슈 `글감 부족`.
 - N01–N20 원작 주제는 없을 때만 시트 맨 아래에 대기 행으로 추가 (기존 셀은 수정하지 않음)
 - 수동 실행은 기본으로 YouTube를 올리지 않음. "upload_youtube"를 켜면 올림
 - 업로드 없이 확인: `python main.py --dry-run`, 추가될 주제 확인: `python generate_episodes.py --plan`
@@ -44,11 +46,11 @@
 
 | Secret | 값 |
 |--------|-----|
-| `GCP_TTS_KEY` | Google Cloud TTS API 키 |
 | `YT_CLIENT_ID` | YouTube OAuth Client ID |
 | `YT_CLIENT_SECRET` | YouTube OAuth Client Secret |
 | `YT_REFRESH_TOKEN` | YouTube Refresh Token |
-| `THREADS_TOKEN` | Threads Access Token |
+| `THREADS_TOKEN` | Threads Access Token (주간 워크플로가 갱신) |
+| `GH_PAT` 또는 `SECRETS_WRITE_TOKEN` | 시크릿 쓰기 PAT. 갱신 워크플로는 `GH_PAT`를 먼저 쓰고, 없으면 `SECRETS_WRITE_TOKEN`을 쓴다 |
 
 ## 파일 구조
 ```
@@ -59,11 +61,15 @@ couple_pipeline/
 ├── assets/
 │   └── cover_duo_pause.mp3          # 커버 남녀 동시 음성 (고정)
 ├── .github/workflows/upload.yml     # GitHub Actions 크론
+├── .github/workflows/refresh-token.yml
+├── .github/workflows/batch_blog.yml # 큐 템플릿 일괄 발행 (LLM 없음)
+├── scripts/refresh_token.py
+├── scripts/check_queue.py
 └── README.md
 ```
 
 ## 비용
 - GitHub Actions: 무료 (월 2,000분)
-- 음성: edge-tts 기본(무료). 실패 시 gTTS, 그다음 Google Cloud TTS. OpenAI TTS는 키가 있고 앞 단계가 모두 실패할 때만
+- 음성: edge-tts 기본(무료). 실패 시 gTTS. Actions에는 유료 TTS 키를 넣지 않는다
 - YouTube/Threads/Blogger API: 무료
 - **예약 파이프라인은 OpenAI로 대본을 만들지 않음**

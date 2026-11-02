@@ -186,16 +186,26 @@ class ParseAndFormatTests(unittest.TestCase):
     def test_workflow_and_docs_dropped_claude(self):
         with open(os.path.join(ROOT, ".github/workflows/upload.yml"), encoding="utf-8") as fh:
             workflow = fh.read()
-        self.assertNotIn("anthropic", workflow)
+        self.assertNotIn("anthropic", workflow.lower())
         self.assertNotIn("ANTHROPIC_API_KEY", workflow)
+        self.assertNotIn("OPENAI", workflow)
+        self.assertNotIn("GEMINI", workflow)
+        self.assertNotIn("GCP_TTS", workflow)
+        self.assertNotIn("GOOGLE_TTS", workflow)
         self.assertNotIn("generate_episodes.py", workflow)
         self.assertIn("edge-tts", workflow)
         self.assertIn("gTTS", workflow)
         self.assertIn("python main.py", workflow)
-        self.assertIn("OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}", workflow)
+        self.assertIn("check_queue.py", workflow)
         self.assertIn("THREADS_TOKEN:", workflow)
         self.assertIn("BLOGGER_REFRESH_TOKEN:", workflow)
         self.assertIn("YT_REFRESH_TOKEN:", workflow)
+        workflow_dir = os.path.join(ROOT, ".github", "workflows")
+        for name in os.listdir(workflow_dir):
+            with open(os.path.join(workflow_dir, name), encoding="utf-8") as wf:
+                text = wf.read()
+            for banned in ("OPENAI", "ANTHROPIC", "GEMINI", "GCP_TTS", "GOOGLE_TTS"):
+                self.assertNotIn(banned, text, name)
 
         with open(os.path.join(ROOT, "generate_episodes.py"), encoding="utf-8") as fh:
             source = fh.read()
@@ -223,6 +233,10 @@ class ParseAndFormatTests(unittest.TestCase):
         self.assertIn("remaining_items = max(0, len(queue) - max(slot, 0))", doc)
         self.assertIn("104", doc)
         self.assertIn("35일", doc)
+        self.assertIn("글감 부족", doc)
+        self.assertIn("remaining_days < 14", doc)
+        self.assertIn("batch_blog_publish.py", doc)
+        self.assertIn("render_blog_post", doc)
 
 
 if __name__ == "__main__":
