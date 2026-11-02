@@ -7,6 +7,8 @@ import os, json, re, sys, time
 from xml.sax.saxutils import escape, quoteattr
 import requests
 
+from scripts.github_issues import report_oauth_refresh_failure
+
 try:
     import gspread
     from google.oauth2.service_account import Credentials
@@ -41,7 +43,7 @@ def get_blogger_token():
         "refresh_token": refresh_token, "grant_type": "refresh_token"
     })
     if resp.status_code != 200:
-        print(f"  ❌ 토큰 갱신 실패: {resp.status_code}")
+        report_oauth_refresh_failure("Blogger", resp)
         return None
     return resp.json()["access_token"]
 

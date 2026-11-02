@@ -63,7 +63,8 @@ def get_blogger_credentials():
         "refresh_token": refresh_token, "grant_type": "refresh_token"
     })
     if token_resp.status_code != 200:
-        print(f"  토큰 갱신 실패: {token_resp.status_code}")
+        from scripts.github_issues import report_oauth_refresh_failure
+        report_oauth_refresh_failure("YouTube", token_resp)
         return None
     return token_resp.json()["access_token"]
 

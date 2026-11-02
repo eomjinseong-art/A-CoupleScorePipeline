@@ -32,9 +32,11 @@ from shorts_format import (
 )
 
 import reconcile
+from scripts.github_issues import report_oauth_refresh_failure
 
 # === 환경 변수 ===
-# GCP_TTS_KEY, OPENAI_API_KEY 는 TTS가 호출 시점에 읽는다. 없으면 그 단계는 건너뛴다.
+# 유료 TTS 키는 워크플로에서 넣지 않는다. 프로세스에 있을 때만 선택 폴백이 된다.
+# Threads 장기 토큰 연장은 주간 워크플로(.github/workflows/refresh-token.yml)만 한다.
 YT_CLIENT_ID = os.environ.get("YT_CLIENT_ID")
 YT_CLIENT_SECRET = os.environ.get("YT_CLIENT_SECRET")
 YT_REFRESH_TOKEN = os.environ.get("YT_REFRESH_TOKEN")
@@ -446,12 +448,7 @@ def upload_youtube(video_path, title, description, tags=None):
         "refresh_token": YT_REFRESH_TOKEN, "grant_type": "refresh_token"
     })
     if token_resp.status_code != 200:
-        err = token_resp.json() if token_resp.headers.get("content-type", "").startswith("application/json") else {"error": token_resp.text[:300]}
-        error_desc = err.get("error_description", err.get("error", "unknown"))
-        print(f"  ❌ YouTube 토큰 갱신 실패 ({token_resp.status_code}): {error_desc}")
-        if "invalid_grant" in str(err):
-            print("  → Refresh Token이 만료되었거나 유효하지 않습니다.")
-            print("  → Google Cloud Console에서 OAuth 토큰을 새로 생성하세요.")
+        report_oauth_refresh_failure("YouTube", token_resp)
         return None
 
     access_token = token_resp.json()["access_token"]
@@ -627,16 +624,6 @@ def run(argv=None):
     print("=" * 50)
     print("그날의 남녀 - 자동화 파이프라인")
     print("=" * 50)
-
-    if not dry_run:
-        try:
-            from scripts.refresh_token import ensure_fresh_threads_token
-            refreshed_token = ensure_fresh_threads_token()
-            if refreshed_token:
-                global THREADS_TOKEN
-                THREADS_TOKEN = refreshed_token
-        except Exception as e:
-            print(f"  [경고] Threads 토큰 자동 연장 점검 중 오류: {e}")
 
     if reconcile.queue_enabled():
         ep = fetch_queue_episode(index)

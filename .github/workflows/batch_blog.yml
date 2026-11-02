@@ -1,7 +1,11 @@
-name: 일괄 블로그 발행 (기존 에피소드)
+name: 일괄 블로그 발행 (큐 템플릿)
 
 on:
   workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
 
 jobs:
   batch-publish:
@@ -17,10 +21,9 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
-      - name: 기존 에피소드 일괄 블로그 발행
+      - name: 큐를 블로그 템플릿으로 발행
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GH_TOKEN: ${{ github.token }}
           BLOGGER_CLIENT_ID: ${{ secrets.BLOGGER_CLIENT_ID }}
           BLOGGER_CLIENT_SECRET: ${{ secrets.BLOGGER_CLIENT_SECRET }}
           BLOGGER_REFRESH_TOKEN: ${{ secrets.BLOGGER_REFRESH_TOKEN }}

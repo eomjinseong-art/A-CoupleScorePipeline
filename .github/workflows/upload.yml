@@ -1,5 +1,9 @@
 name: 그날의남녀 자동 업로드
 
+permissions:
+  contents: read
+  issues: write
+
 on:
   schedule:
     # KST 09:00 → UTC 00:00. Threads·블로그만. YouTube는 올리지 않는다.
@@ -34,18 +38,22 @@ jobs:
     # 대본은 data/reconcile_episodes.json 을 소비한다. 예약 실행에서 LLM으로 에피소드를 만들지 않는다.
     - name: Run upload pipeline (영상 + 스레드 + 블로그)
       env:
-        GCP_TTS_KEY: ${{ secrets.GCP_TTS_KEY }}
+        GH_TOKEN: ${{ github.token }}
         YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
         YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
         YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
         THREADS_TOKEN: ${{ secrets.THREADS_TOKEN }}
         GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
         GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
-        # TTS 최후 폴백 전용. 대본 생성에는 쓰지 않는다. 키가 없으면 OpenAI TTS는 건너뛴다.
-        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         BLOGGER_CLIENT_ID: ${{ secrets.BLOGGER_CLIENT_ID }}
         BLOGGER_CLIENT_SECRET: ${{ secrets.BLOGGER_CLIENT_SECRET }}
         BLOGGER_REFRESH_TOKEN: ${{ secrets.BLOGGER_REFRESH_TOKEN }}
         # 21:00 KST 예약이거나, 수동 실행에서 업로드를 켠 경우에만 YouTube.
         YOUTUBE_UPLOAD: ${{ (github.event.schedule == '0 12 * * *' || inputs.upload_youtube == true || inputs.upload_youtube == 'true') && 'true' || 'false' }}
       run: python main.py
+
+    - name: 글감 잔량 확인
+      if: always()
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: python scripts/check_queue.py

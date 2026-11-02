@@ -1,192 +1,143 @@
 """
-그날의남녀 - 기존 완료 에피소드 일괄 블로그 발행 (수동)
+그날의남녀 - 커밋된 화해 큐를 블로그 템플릿으로 발행 (수동)
 
-workflow_dispatch 로만 돈다. 초안은 Gemini(GEMINI_API_KEY, gemini-2.5-flash)를 우선하고
-그 키가 없을 때만 OpenAI를 쓴다.
+workflow_dispatch 로만 돈다. data/reconcile_episodes.json 을
+render_blog_post()로 HTML로 옮긴 뒤 Blogger에 올린다. LLM을 호출하지 않는다.
 """
-import os, sys, time, csv, io, requests
+import os
+import sys
+import time
+
+import requests
+
+from generate_blog_content import render_blog_post
 from publish_blogger import (
-    get_blogger_access_token,
-    get_blog_id,
-    publish_to_blogger,
     BLOGGER_API_BASE,
+    get_blog_id,
+    get_blogger_access_token,
+    publish_to_blogger,
 )
-from llm_client import chat_completion, completion_text, parse_json_content, resolve_chat
+import reconcile
 
 BLOGGER_CLIENT_ID = os.environ.get("BLOGGER_CLIENT_ID")
 BLOGGER_CLIENT_SECRET = os.environ.get("BLOGGER_CLIENT_SECRET")
 BLOGGER_REFRESH_TOKEN = os.environ.get("BLOGGER_REFRESH_TOKEN")
 
-SHEET_ID = "1l7niiK9RbZwo_x0PI6T2vCqjIKn9c_gvxVrrKjwyo20"
-SHEET_CSV_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid=0"
 
-BLOG_PROMPT = """당신은 '그날의남녀' 유튜브 채널의 블로그 작가입니다.
-남녀 두 사람이 싸운 사연을 바탕으로 티스토리/블로거용 심층 분석 블로그 포스팅을 작성해주세요.
+def generate_blog_content(episode):
+    """시트 행 또는 큐 항목을 블로그 템플릿으로 만든다. LLM을 호출하지 않는다."""
+    if episode.get("fight") or episode.get("source") == "reconcile":
+        return render_blog_post(episode)
+    return render_blog_post({
+        "hook": episode.get("훅") or episode.get("hook") or episode.get("주제") or episode.get("topic") or "",
+        "topic": episode.get("주제") or episode.get("topic") or "",
+        "script": episode.get("대본") or episode.get("script") or "",
+        "fight": episode.get("fight") or "",
+        "makeup": episode.get("makeup") or "",
+        "psychology": episode.get("심리") or episode.get("psychology") or episode.get("warm") or "",
+        "question": episode.get("마무리 질문") or episode.get("question") or "",
+        "outfit": episode.get("outfit") or "",
+        "shop": bool(episode.get("shop")),
+    })
 
-## 사연 정보
-- 화자: {gender}
-- 주제: {topic}
-- 대본: {script}
-- 마무리 질문: {question}
 
-## 블로그 포스팅 규칙
-1. 제목: SEO 친화적, 호기심 유발 (예: "남자친구가 X를 한 이유 - 심리 분석")
-2. 도입부: 독자가 공감할 수 있는 질문이나 시나리오로 시작
-3. 상황 묘사: 대본의 내용을 자연스러운 서사로 재구성
-4. 심리 분석: "이 상황에서 남자는 ~을 느끼고, 여자는 ~할 수 있어요" 형태로 분석
-5. 해결책: 구체적인 소통법이나 관계 조언 제시
-6. 마무리: 독자에게 질문 + 댓글 유도
-7. 길이: 1200~1800자
-8. 톤: 친근하지만 진지한 상담가 톤
-9. HTML: <div> 태그로 감싸지 말고 순수 HTML만 사용 (p, h2, h3, strong, em 등)
-
-## 출력 형식 (JSON)
-{{"title": "블로그 제목", "html": "<p>본문 HTML...</p>", "tags": ["태그1", "태그2"]}}
-
-반드시 JSON만 출력하세요. 다른 설명이나 마크다운 코드 블록은 포함하지 마세요."""
+def already_posted(posts, item_id, hook, fight):
+    """이미 같은 회차 또는 같은 제목으로 올라간 글이면 True."""
+    marker = f"episode:{item_id}"
+    first = ""
+    for line in (fight or "").splitlines():
+        line = line.strip()
+        if line:
+            first = line[:80]
+            break
+    for title, content in posts:
+        title = title or ""
+        content = content or ""
+        if marker in title or marker in content:
+            return True
+        if hook and title.strip() == hook.strip():
+            return True
+        if len(first) >= 12 and first in content:
+            return True
+    return False
 
 
 def get_existing_posts(token, blog_id):
-    """기존 블로그 포스트 목록에서 EP 번호 추출 (중복 방지)"""
-    existing = set()
-    url = f"{BLOGGER_API_BASE}/blogs/{blog_id}/posts?maxResults=50"
+    """기존 글의 제목과 본문. 토큰은 출력하지 않는다."""
+    found = []
+    url = (
+        f"{BLOGGER_API_BASE}/blogs/{blog_id}/posts"
+        "?maxResults=20&fetchBodies=true&fields=nextPageToken,items(title,content)"
+    )
     while url:
-        resp = requests.get(url, headers={"Authorization": f"Bearer {token}"})
+        resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
         if resp.status_code != 200:
             print(f"  포스트 목록 조회 상태: {resp.status_code}")
             break
         data = resp.json()
         for post in data.get("items", []):
-            title = post.get("title", "")
-            for word in title.split():
-                word = word.replace("EP.", "").replace("-", "")
-                if word.isdigit():
-                    existing.add(word)
-        url = data.get("nextPageToken")
-        if url:
-            url = f"{BLOGGER_API_BASE}/blogs/{blog_id}/posts?maxResults=50&pageToken={url}"
-    print(f"이미 발행된 에피소드: {len(existing)}개")
-    return existing
-
-
-def fetch_episodes():
-    """Google Sheets에서 완료된 에피소드 읽기"""
-    resp = requests.get(SHEET_CSV_URL)
-    if resp.status_code != 200:
-        print(f"시트 CSV 공개 조회 불가 (HTTP {resp.status_code}) - main.py (upload.yml)에서 서비스 계정으로 처리됩니다.")
-        return []
-    resp.encoding = "utf-8"
-    reader = list(csv.DictReader(io.StringIO(resp.text)))
-    done = [r for r in reader if r.get("Status", "").strip() == "완료"]
-    print(f"전체 에피소드: {len(reader)}개, 완료: {len(done)}개")
-    return done
-
-
-def generate_blog_content(episode):
-    """수동 발행용 블로그 초안. Gemini 우선, 없으면 OpenAI."""
-    gender = episode.get("화자", "남자")
-    topic = episode.get("주제", "")
-    script = episode.get("대본", "")
-    question = episode.get("마무리 질문", "")
-
-    prompt = BLOG_PROMPT.format(
-        gender=gender, topic=topic, script=script, question=question
-    )
-    resp, spec = chat_completion(
-        [{"role": "user", "content": prompt}],
-        max_tokens=3000,
-        temperature=0.7,
-        response_format={"type": "json_object"},
-    )
-    if resp is None:
-        print("  ❌ GEMINI_API_KEY(우선) 또는 OPENAI_API_KEY 없음")
-        return None
-    if resp.status_code != 200:
-        print(f"  LLM 오류 ({spec['provider']} {spec['model']}): {resp.status_code}")
-        return None
-    try:
-        return parse_json_content(completion_text(resp))
-    except (KeyError, IndexError, TypeError, ValueError) as exc:
-        print(f"  JSON 파싱 실패: {exc}")
-        return None
+            found.append((post.get("title") or "", post.get("content") or ""))
+        page = data.get("nextPageToken")
+        if page:
+            url = (
+                f"{BLOGGER_API_BASE}/blogs/{blog_id}/posts"
+                f"?maxResults=20&fetchBodies=true&pageToken={page}"
+                "&fields=nextPageToken,items(title,content)"
+            )
+        else:
+            url = None
+    print(f"이미 발행된 글: {len(found)}개")
+    return found
 
 
 def main():
     print("=" * 60)
-    print("그날의남녀 - 기존 에피소드 일괄 블로그 발행")
+    print("그날의남녀 - 큐 템플릿 일괄 블로그 발행")
     print("=" * 60)
-
-    if resolve_chat() is None:
-        print("수동 발행에는 GEMINI_API_KEY(우선) 또는 OPENAI_API_KEY가 필요합니다.")
-        sys.exit(1)
 
     if not all([BLOGGER_CLIENT_ID, BLOGGER_CLIENT_SECRET, BLOGGER_REFRESH_TOKEN]):
         print("Blogger 인증 정보 필요")
-        sys.exit(1)
+        return 1
 
     token = get_blogger_access_token()
     if not token:
         print("Blogger 인증 실패")
-        sys.exit(1)
+        return 1
 
-    # 연결된 블로그 목록 진단 출력
-    resp = requests.get(
-        f"{BLOGGER_API_BASE}/users/self/blogs",
-        headers={"Authorization": f"Bearer {token}"},
-    )
-    if resp.status_code == 200:
-        items = resp.json().get("items", [])
-        print(f"  계정 연결 블로그 수: {len(items)}개")
-        for b in items:
-            print(f"   - id={b.get('id')} name={b.get('name')} url={b.get('url')} status={b.get('status')}")
-
-    blog_id, _ = get_blog_id(token)
+    blog_id, _blog_url = get_blog_id(token)
     if not blog_id:
         print("블로그 ID 조회 실패")
-        sys.exit(1)
+        return 1
 
     existing = get_existing_posts(token, blog_id)
-
-    episodes = fetch_episodes()
-    if not episodes:
-        print("발행할 추가 에피소드 없음 (Blogger 연결 및 타겟 블로그 확인 완료)")
-        return
+    queue = reconcile.load_queue()
+    print(f"큐: {len(queue)}편")
 
     success = 0
     fail = 0
     skip = 0
-
-    for i, ep in enumerate(episodes):
-        ep_num = ep.get("EP", "").replace("EP.", "")
-        topic = ep.get("주제", "제목 없음")
-        gender = ep.get("화자", "남자")
-
-        if ep_num in existing:
+    for item in queue:
+        ep = reconcile.to_episode(item)
+        blog = render_blog_post(ep)
+        title = blog["title"]
+        if already_posted(existing, item["id"], title, item.get("fight") or ""):
             skip += 1
             continue
-
-        print(f"\n[{i+1}/{len(episodes)}] EP.{ep_num} - {topic} ({gender})")
-        blog_data = generate_blog_content(ep)
-        if not blog_data:
-            fail += 1
-            continue
-
-        title = blog_data.get("title", f"EP.{ep_num} - {topic}")
-        html = blog_data.get("html", "")
-        tags = blog_data.get("tags", ["그날의남녀", "연애상담", "커플싸움"])
-
-        post_url = publish_to_blogger(token, blog_id, title, html, tags)
+        html = f"<!-- episode:{item['id']} -->\n{blog['html']}"
+        print(f"\n{item['id']} {title}")
+        post_url = publish_to_blogger(token, blog_id, title, html, blog["tags"])
         if post_url:
             success += 1
+            existing.append((title, html))
         else:
             fail += 1
-
         time.sleep(5)
 
     print(f"\n{'=' * 60}")
-    print(f"완료: {success}건 성공, {fail}건 실패, {skip}건 건너뜀 (총 {len(episodes)}건)")
+    print(f"완료: {success}건 성공, {fail}건 실패, {skip}건 건너뜀 (총 {len(queue)}건)")
     print(f"{'=' * 60}")
+    return 0 if fail == 0 else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

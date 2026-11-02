@@ -94,12 +94,24 @@ class ScheduleTests(unittest.TestCase):
         with patch.dict(os.environ, {"GEMINI_API_KEY": "gem", "OPENAI_API_KEY": "oa", "GEMINI_MODEL": ""}), \
                 patch("llm_client.requests.post", side_effect=post):
             data = generate_blog_post(episode)
-            batch = generate_blog_content({"화자": "여자", "주제": "답장", "대본": "싸웠어요", "마무리 질문": "어떻게 화해해요?"})
         self.assertEqual(data["title"], "제목")
-        self.assertEqual(batch["title"], "제목")
         self.assertIn("generativelanguage.googleapis.com", captured["url"])
         self.assertEqual(captured["body"]["model"], "gemini-2.5-flash")
         self.assertNotIn("api.openai.com", captured["url"])
+
+    def test_batch_blog_renders_the_queue_without_an_llm(self):
+        with patch("llm_client.requests.post") as post:
+            batch = generate_blog_content({
+                "화자": "여자",
+                "주제": "답장",
+                "훅": "답장이 늦었다",
+                "대본": "싸웠어요.\n한 줄",
+                "마무리 질문": "여러분은 어떻게 화해해요?",
+            })
+        post.assert_not_called()
+        self.assertEqual(batch["title"], "답장이 늦었다")
+        self.assertIn("싸웠어요.", batch["html"])
+        self.assertIn("화해", batch["html"])
 
     def test_manual_blog_uses_openai_only_without_gemini(self):
         captured = {}
@@ -111,7 +123,13 @@ class ScheduleTests(unittest.TestCase):
 
         with patch.dict(os.environ, {"GEMINI_API_KEY": "", "OPENAI_API_KEY": "oa", "OPENAI_MODEL": ""}), \
                 patch("llm_client.requests.post", side_effect=post):
-            generate_blog_content({"화자": "남자", "주제": "기념일", "대본": "싸웠습니다", "마무리 질문": "어떻게 화해해요?"})
+            generate_blog_post({
+                "gender": "남자",
+                "ep": "R002",
+                "topic": "기념일",
+                "script": "싸웠습니다",
+                "question": "어떻게 화해해요?",
+            })
         self.assertIn("api.openai.com", captured["url"])
         self.assertEqual(captured["model"], "gpt-4o-mini")
 

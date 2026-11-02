@@ -24,7 +24,7 @@ OVERRIDES_CSV = os.path.join(DATA_DIR, "ep078_107_overrides.csv")
 TOPICS_CSV = os.path.join(DATA_DIR, "topics_n01_n20.csv")
 
 # 예약 실행의 기본 음성. 남녀 대사는 voice="male"/"female"로 그대로 두고 여기서만 성우를 고른다.
-# 순서는 main.gen_tts: edge-tts → gTTS → Google Cloud TTS → OpenAI TTS.
+# 워크플로 음성은 edge-tts → gTTS. Google Cloud TTS·OpenAI TTS는 키가 프로세스에 있을 때만 선택 폴백이다.
 EDGE_VOICES = {"male": "ko-KR-InJoonNeural", "female": "ko-KR-SunHiNeural"}
 EDGE_TTS_RATE = "+20%"
 EDGE_TTS_PITCH = {"male": "-4Hz", "female": "+4Hz"}

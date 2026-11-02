@@ -10,7 +10,9 @@
 
 다른 커밋된 대본 큐는 없다. `data/topics_n01_n20.csv`와 Google Sheets의 `대기` 행은 예약 경로에서 읽지 않는다. 시트 행은 환경변수 `RECONCILE_QUEUE=off`로 수동 실행할 때만 사용한다.
 
-수동으로 대본을 만들 때만 `python generate_episodes.py`를 쓴다. `GEMINI_API_KEY`가 있으면 Gemini OpenAI 호환 엔드포인트와 모델 `gemini-2.5-flash`를 쓰고, 그 키가 없을 때만 `OPENAI_API_KEY`를 쓴다. 블로그 수동 스크립트(`generate_blog_content.py`, `batch_blog_publish.py`)도 같은 순서다. 예약 실행의 블로그 HTML은 큐 원문으로 만들며 LLM을 호출하지 않는다.
+예약 실행과 일괄 블로그 발행(`.github/workflows/batch_blog.yml`)은 LLM을 호출하지 않는다. 블로그 HTML은 `generate_blog_content.render_blog_post()`가 큐 항목의 싸움·화해·따뜻한 한 줄·질문을 템플릿에 넣어 만든다. `batch_blog_publish.py`는 `data/reconcile_episodes.json`만 읽고, 이미 같은 제목이나 `episode:<id>` 표식이 있는 글은 건너뛴 뒤 Blogger에 올린다.
+
+수동으로 새 대본을 만들 때만 `python generate_episodes.py`를 쓴다. 그 로컬 스크립트는 `GEMINI_API_KEY`(gemini-2.5-flash)를 우선하고, 없을 때만 `OPENAI_API_KEY`를 쓴다. `generate_blog_content.py`를 직접 실행할 때만 같은 순서로 초안을 만든다. 두 키 모두 Actions 워크플로에 넣지 않는다.
 
 ## 항목 스키마
 
@@ -66,6 +68,10 @@ python -c "import reconcile; print(reconcile.queue_report())"
 ```
 
 `queue_report()` 키: `path`, `total`, `slot`, `current_id`, `remaining_items`, `remaining_days`, `slots_per_day`, `start`.
+
+## 글감 부족
+
+`.github/workflows/upload.yml`은 매번 `scripts/check_queue.py`를 실행한다. `remaining_days < 14`이면 GitHub 이슈 `글감 부족`을 열거나, 이미 열려 있으면 본문을 남은 편 수로 갱신한다. 14일 이상이면 그 이슈를 닫는다. 예약 실행은 이 경우에도 LLM으로 글을 만들지 않는다.
 
 09:00 KST 크론이 이미 성공했다면 이번 슬롯은 나간 것이다. 그때는 남은 편에서 1을 빼고, 남은 날에서 0.5를 뺀다. 아래 스냅샷은 크론 성공 여부와 상관없이 시계만으로 계산한 값이다.
 
