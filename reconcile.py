@@ -6,7 +6,8 @@
 - 저장소에 상태를 커밋하지 않아도 되도록, 회차는 '예약 슬롯 번호'로 정한다.
   UTC 날짜 기준 하루 2슬롯: 오전(UTC 00:00 크론 = KST 09:00) / 저녁(UTC 12:00 크론 = KST 21:00).
   GitHub 크론이 몇 시간 늦어도 같은 UTC 날짜·같은 반나절 안에 돌기 때문에 슬롯이 흔들리지 않는다.
-- 큐가 끝나면(슬롯 번호 ≥ 큐 길이) 기존처럼 시트의 '대기' 행으로 돌아간다.
+- 큐가 끝나면(슬롯 번호 ≥ 큐 길이) 예약 실행은 시트로 넘어가지 않고 건너뛴다.
+  시트 '대기' 행은 RECONCILE_QUEUE=off 일 때만 읽는다. 어느 쪽이든 예약 경로에서 LLM은 호출하지 않는다.
 """
 import json
 import os
@@ -50,6 +51,33 @@ def slot_index(now=None, start=QUEUE_START):
     now = now.astimezone(timezone.utc)
     days = (now.date() - start).days
     return days * 2 + (1 if now.hour >= 12 else 0)
+
+
+def queue_enabled(env=None):
+    env = os.environ if env is None else env
+    return (env.get("RECONCILE_QUEUE") or "on").strip().lower() not in ("0", "off", "false", "no")
+
+
+def queue_report(now=None, queue=None):
+    """이번 슬롯을 포함한 남은 편 수. 하루 2슬롯이라 남은 날 = 남은 편 / 2.
+
+    소비 기록은 파일에 쓰지 않는다. index < slot 인 항목은 이미 지난 슬롯이다.
+    """
+    items = load_queue() if queue is None else queue
+    slot = slot_index(now)
+    total = len(items)
+    remaining = max(0, total - max(slot, 0))
+    current_id = items[slot].get("id") if 0 <= slot < total else None
+    return {
+        "path": QUEUE_PATH,
+        "total": total,
+        "slot": slot,
+        "current_id": current_id,
+        "remaining_items": remaining,
+        "remaining_days": remaining / 2,
+        "slots_per_day": 2,
+        "start": QUEUE_START.isoformat(),
+    }
 
 
 def episode_label(item):

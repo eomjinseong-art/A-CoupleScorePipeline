@@ -1,12 +1,14 @@
 """
-그날의 남녀 - 에피소드 자동 보충 스크립트
+그날의 남녀 - 에피소드 수동 생성 스크립트
 
-Google Sheets에서 "대기" 상태의 에피소드가 특정 임계값 이하로 떨어지면,
-OpenAI API를 사용하여 새 에피소드 30개를 자동으로 생성하여 시트에 추가한다.
+예약 워크플로는 이 파일을 실행하지 않는다. 대본은 data/reconcile_episodes.json 을 소비한다.
+직접 실행할 때만, 시트 '대기'가 임계값 이하면 LLM으로 30개를 만들어 시트에 추가한다.
 
 필요 환경변수:
-  OPENAI_API_KEY
-  OPENAI_MODEL (기본값 gpt-4.1-mini)
+  GEMINI_API_KEY (우선, 모델 gemini-2.5-flash, OpenAI 호환 엔드포인트)
+  GEMINI_MODEL (선택)
+  OPENAI_API_KEY (Gemini 키가 없을 때만)
+  OPENAI_MODEL (기본값 gpt-4.1-mini, OpenAI 폴백일 때만)
   GOOGLE_SERVICE_ACCOUNT
 
 필요 패키지:
@@ -22,6 +24,7 @@ import time
 
 import requests
 
+from llm_client import DEFAULT_GEMINI_MODEL, resolve_chat
 from shorts_format import (
     REFILL_SYSTEM_PROMPT,
     generated_to_row,
@@ -73,6 +76,38 @@ EPISODE_JSON_SCHEMA = {
 
 def openai_model():
     return (os.environ.get("OPENAI_MODEL") or DEFAULT_OPENAI_MODEL).strip() or DEFAULT_OPENAI_MODEL
+
+
+def episode_llm():
+    """수동 생성에 쓸 provider/model. 키가 없어도 요청 형식의 기본값은 Gemini다."""
+    spec = resolve_chat(default_openai_model=DEFAULT_OPENAI_MODEL)
+    if spec:
+        return spec
+    model = (os.environ.get("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL).strip() or DEFAULT_GEMINI_MODEL
+    return {"provider": "gemini", "model": model, "api_key": "", "base_url": ""}
+
+
+def _chat_request(provider, model, messages):
+    if provider == "openai":
+        return {
+            "model": model,
+            "max_completion_tokens": 16000,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "episode_batch",
+                    "strict": True,
+                    "schema": EPISODE_JSON_SCHEMA,
+                },
+            },
+            "messages": messages,
+        }
+    return {
+        "model": model,
+        "max_tokens": 16000,
+        "response_format": {"type": "json_object"},
+        "messages": messages,
+    }
 
 
 def parse_generated_payload(raw):
@@ -159,8 +194,11 @@ def get_next_ep_number(service):
     return max(ep_nums, default=0) + 1
 
 
-def generate_episodes(client, existing_topics, count, sleep=time.sleep):
-    """OpenAI API로 새 에피소드를 만든다. 실패하면 지수 백오프로 재시도한다."""
+def generate_episodes(client, existing_topics, count, sleep=time.sleep, provider=None, model=None):
+    """LLM으로 새 에피소드를 만든다. 실패하면 지수 백오프로 재시도한다.
+
+    예약 실행에서는 호출하지 않는다. provider 기본값은 Gemini다.
+    """
     topics_text = "\n".join(f"- {t}" for t in existing_topics) if existing_topics else "(없음)"
     user_prompt = (
         f"아래는 이미 사용된 주제 목록입니다. 띄어쓰기와 '편'을 빼면 같은 주제, "
@@ -170,25 +208,15 @@ def generate_episodes(client, existing_topics, count, sleep=time.sleep):
         f"각 항목에 훅, 심리 한 줄, '남자쪽 / 여자쪽' 마무리 질문을 넣으세요.\n"
         f'출력은 {{"episodes": [에피소드 {count}개]}} JSON 하나입니다. 각 항목은 스키마 그대로 쓰세요.'
     )
-    model = openai_model()
-    request = {
-        "model": model,
-        "max_completion_tokens": 16000,
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {
-                "name": "episode_batch",
-                "strict": True,
-                "schema": EPISODE_JSON_SCHEMA,
-            },
-        },
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-    }
+    spec = episode_llm()
+    provider = provider or spec["provider"]
+    model = model or spec["model"]
+    request = _chat_request(provider, model, [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
+    ])
 
-    print(f"  OpenAI API 호출 중... ({count}개 생성 요청, 모델 {model})")
+    print(f"  {provider} 호출 중... ({count}개 생성 요청, 모델 {model})")
     attempts = len(OPENAI_RETRY_BACKOFF_SECONDS) + 1
     last_error = None
     for attempt in range(attempts):
@@ -204,7 +232,7 @@ def generate_episodes(client, existing_topics, count, sleep=time.sleep):
             if attempt >= len(OPENAI_RETRY_BACKOFF_SECONDS):
                 raise
             wait = OPENAI_RETRY_BACKOFF_SECONDS[attempt]
-            print(f"  OpenAI 호출 실패, {wait}초 후 재시도 ({attempt + 1}회차): {exc}")
+            print(f"  LLM 호출 실패, {wait}초 후 재시도 ({attempt + 1}회차): {exc}")
             sleep(wait)
     raise last_error
 
@@ -308,17 +336,27 @@ def main(argv=None):
 
     print("  ⚠ 임계값 이하! 보충 시작...")
 
-    print(f"[2/4] OpenAI API로 {BATCH_SIZE}개 에피소드 생성...")
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        raise SystemExit("OPENAI_API_KEY 환경변수가 필요합니다.")
+    print(f"[2/4] LLM으로 {BATCH_SIZE}개 에피소드 생성 (수동, Gemini 우선)...")
+    spec = resolve_chat(default_openai_model=DEFAULT_OPENAI_MODEL)
+    if not spec:
+        raise SystemExit(
+            "수동 생성에는 GEMINI_API_KEY(우선) 또는 OPENAI_API_KEY가 필요합니다. "
+            "예약 실행은 data/reconcile_episodes.json 을 쓰므로 이 스크립트를 호출하지 않습니다."
+        )
     from openai import OpenAI
-    client = OpenAI(api_key=api_key)
+    client_kwargs = {"api_key": spec["api_key"]}
+    if spec["provider"] == "gemini":
+        client_kwargs["base_url"] = spec["base_url"]
+    client = OpenAI(**client_kwargs)
+    print(f"  LLM: {spec['provider']} / {spec['model']}")
 
     existing_topics = get_existing_topics(service)
     print(f"  기존 주제 {len(existing_topics)}개 확인")
 
-    episodes = generate_episodes(client, existing_topics, BATCH_SIZE)
+    episodes = generate_episodes(
+        client, existing_topics, BATCH_SIZE,
+        provider=spec["provider"], model=spec["model"],
+    )
 
     print("[3/4] 생성된 에피소드 검증...")
     kept = []

@@ -1,16 +1,18 @@
 """
-그날의남녀 - 기존 완료 에피소드 일괄 블로그 발행
-완료된 에피소드를 모두 읽어 블로그 콘텐츠를 생성하고 Blogger에 발행한다.
+그날의남녀 - 기존 완료 에피소드 일괄 블로그 발행 (수동)
+
+workflow_dispatch 로만 돈다. 초안은 Gemini(GEMINI_API_KEY, gemini-2.5-flash)를 우선하고
+그 키가 없을 때만 OpenAI를 쓴다.
 """
-import os, json, sys, time, csv, io, requests
+import os, sys, time, csv, io, requests
 from publish_blogger import (
     get_blogger_access_token,
     get_blog_id,
     publish_to_blogger,
     BLOGGER_API_BASE,
 )
+from llm_client import chat_completion, completion_text, parse_json_content, resolve_chat
 
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 BLOGGER_CLIENT_ID = os.environ.get("BLOGGER_CLIENT_ID")
 BLOGGER_CLIENT_SECRET = os.environ.get("BLOGGER_CLIENT_SECRET")
 BLOGGER_REFRESH_TOKEN = os.environ.get("BLOGGER_REFRESH_TOKEN")
@@ -81,7 +83,7 @@ def fetch_episodes():
 
 
 def generate_blog_content(episode):
-    """ChatGPT로 블로그 콘텐츠 생성"""
+    """수동 발행용 블로그 초안. Gemini 우선, 없으면 OpenAI."""
     gender = episode.get("화자", "남자")
     topic = episode.get("주제", "")
     script = episode.get("대본", "")
@@ -90,32 +92,22 @@ def generate_blog_content(episode):
     prompt = BLOG_PROMPT.format(
         gender=gender, topic=topic, script=script, question=question
     )
-
-    resp = requests.post(
-        "https://api.openai.com/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": "gpt-4o-mini",
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 3000,
-            "temperature": 0.7,
-        },
+    resp, spec = chat_completion(
+        [{"role": "user", "content": prompt}],
+        max_tokens=3000,
+        temperature=0.7,
+        response_format={"type": "json_object"},
     )
-
-    if resp.status_code != 200:
-        print(f"  ChatGPT 오류: {resp.status_code}")
+    if resp is None:
+        print("  ❌ GEMINI_API_KEY(우선) 또는 OPENAI_API_KEY 없음")
         return None
-
-    raw = resp.json()["choices"][0]["message"]["content"].strip()
-    raw = raw.removeprefix("```json").removesuffix("```").strip()
-
+    if resp.status_code != 200:
+        print(f"  LLM 오류 ({spec['provider']} {spec['model']}): {resp.status_code}")
+        return None
     try:
-        return json.loads(raw)
-    except json.JSONDecodeError as e:
-        print(f"  JSON 파싱 실패: {e}")
+        return parse_json_content(completion_text(resp))
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        print(f"  JSON 파싱 실패: {exc}")
         return None
 
 
@@ -123,6 +115,10 @@ def main():
     print("=" * 60)
     print("그날의남녀 - 기존 에피소드 일괄 블로그 발행")
     print("=" * 60)
+
+    if resolve_chat() is None:
+        print("수동 발행에는 GEMINI_API_KEY(우선) 또는 OPENAI_API_KEY가 필요합니다.")
+        sys.exit(1)
 
     if not all([BLOGGER_CLIENT_ID, BLOGGER_CLIENT_SECRET, BLOGGER_REFRESH_TOKEN]):
         print("Blogger 인증 정보 필요")

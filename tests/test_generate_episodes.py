@@ -5,13 +5,13 @@ import unittest
 from unittest.mock import patch
 
 from generate_episodes import (
-    DEFAULT_OPENAI_MODEL,
     EPISODE_JSON_SCHEMA,
     generate_episodes,
     parse_generated_payload,
     validate_episode,
     episodes_to_rows,
 )
+from llm_client import DEFAULT_GEMINI_MODEL
 from shorts_format import generated_to_row
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -88,21 +88,20 @@ class ParseAndFormatTests(unittest.TestCase):
         }
         client = FakeClient([FakeResponse(json.dumps(payload, ensure_ascii=False))])
         slept = []
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("OPENAI_MODEL", None)
+        with patch.dict(os.environ, {
+            "GEMINI_API_KEY": "",
+            "OPENAI_API_KEY": "",
+            "GEMINI_MODEL": "",
+            "OPENAI_MODEL": "",
+        }):
             episodes = generate_episodes(client, ["영화관"], 4, sleep=slept.append)
 
         self.assertEqual(slept, [])
         call = client.calls[0]
-        self.assertEqual(call["model"], DEFAULT_OPENAI_MODEL)
-        self.assertEqual(call["response_format"]["type"], "json_schema")
-        schema = call["response_format"]["json_schema"]
-        self.assertTrue(schema["strict"])
-        self.assertEqual(schema["schema"], EPISODE_JSON_SCHEMA)
-        self.assertEqual(
-            schema["schema"]["properties"]["episodes"]["items"]["required"],
-            ["화자", "주제", "훅", "대본", "심리", "마무리_질문", "Threads_글감"],
-        )
+        self.assertEqual(call["model"], DEFAULT_GEMINI_MODEL)
+        self.assertEqual(call["response_format"]["type"], "json_object")
+        self.assertEqual(call["max_tokens"], 16000)
+        self.assertNotIn("max_completion_tokens", call)
         self.assertIn("돈·소비", call["messages"][1]["content"])
 
         kept = keep_valid(episodes, ["영화관"])
@@ -139,11 +138,37 @@ class ParseAndFormatTests(unittest.TestCase):
         self.assertEqual(len(client.calls), 3)
         self.assertEqual(episodes[0]["주제"], "에어컨 온도")
 
-    def test_model_comes_from_env(self):
+    def test_gemini_wins_and_model_comes_from_env(self):
         client = FakeClient([FakeResponse(json.dumps({"episodes": [sample_episode()]}))])
-        with patch.dict(os.environ, {"OPENAI_MODEL": "gpt-4.1"}):
+        with patch.dict(os.environ, {
+            "GEMINI_API_KEY": "gem",
+            "GEMINI_MODEL": "gemini-2.5-pro",
+            "OPENAI_API_KEY": "oa",
+            "OPENAI_MODEL": "gpt-4.1",
+        }):
             generate_episodes(client, [], 1, sleep=lambda _seconds: None)
-        self.assertEqual(client.calls[0]["model"], "gpt-4.1")
+        self.assertEqual(client.calls[0]["model"], "gemini-2.5-pro")
+        self.assertEqual(client.calls[0]["response_format"]["type"], "json_object")
+
+    def test_openai_fallback_keeps_strict_schema(self):
+        client = FakeClient([FakeResponse(json.dumps({"episodes": [sample_episode()]}))])
+        with patch.dict(os.environ, {
+            "GEMINI_API_KEY": "",
+            "OPENAI_API_KEY": "oa",
+            "OPENAI_MODEL": "gpt-4.1",
+        }):
+            generate_episodes(client, [], 1, sleep=lambda _seconds: None)
+        call = client.calls[0]
+        self.assertEqual(call["model"], "gpt-4.1")
+        self.assertEqual(call["max_completion_tokens"], 16000)
+        self.assertEqual(call["response_format"]["type"], "json_schema")
+        schema = call["response_format"]["json_schema"]
+        self.assertTrue(schema["strict"])
+        self.assertEqual(schema["schema"], EPISODE_JSON_SCHEMA)
+        self.assertEqual(
+            schema["schema"]["properties"]["episodes"]["items"]["required"],
+            ["화자", "주제", "훅", "대본", "심리", "마무리_질문", "Threads_글감"],
+        )
 
     def test_refusal_and_bad_shape_are_retried_then_raised(self):
         client = FakeClient([
@@ -163,27 +188,41 @@ class ParseAndFormatTests(unittest.TestCase):
             workflow = fh.read()
         self.assertNotIn("anthropic", workflow)
         self.assertNotIn("ANTHROPIC_API_KEY", workflow)
+        self.assertNotIn("generate_episodes.py", workflow)
+        self.assertIn("edge-tts", workflow)
+        self.assertIn("gTTS", workflow)
+        self.assertIn("python main.py", workflow)
         self.assertIn("OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}", workflow)
-        self.assertIn("continue-on-error: true", workflow)
-        refill, upload = workflow.split("- name: Run upload pipeline", 1)
-        self.assertIn("continue-on-error: true", refill)
-        self.assertIn("python generate_episodes.py", refill)
-        self.assertIn("python main.py", upload)
+        self.assertIn("THREADS_TOKEN:", workflow)
+        self.assertIn("BLOGGER_REFRESH_TOKEN:", workflow)
+        self.assertIn("YT_REFRESH_TOKEN:", workflow)
 
         with open(os.path.join(ROOT, "generate_episodes.py"), encoding="utf-8") as fh:
             source = fh.read()
         lowered = source.lower()
         self.assertNotIn("anthropic", lowered)
         self.assertNotIn("claude", lowered)
+        self.assertIn("gemini-2.5-flash", source)
+        self.assertIn("GEMINI_API_KEY", source)
 
         with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as fh:
             readme = fh.read()
         self.assertNotIn("Claude", readme)
-        self.assertIn("OpenAI가 편이 갈리는 주제 30개", readme)
+        self.assertNotIn("OpenAI가 편이 갈리는 주제 30개", readme)
+        self.assertIn("예약 실행은 LLM으로 대본을 만들지 않는다", readme)
 
         with open(os.path.join(ROOT, "generate_blog_content.py"), encoding="utf-8") as fh:
             blog = fh.read()
         self.assertNotIn("Claude", blog)
+        self.assertIn("render_blog_post", blog)
+        self.assertIn("GEMINI_API_KEY", blog)
+
+        with open(os.path.join(ROOT, "docs", "CONTENT_QUEUE.md"), encoding="utf-8") as fh:
+            doc = fh.read()
+        self.assertIn("data/reconcile_episodes.json", doc)
+        self.assertIn("remaining_items = max(0, len(queue) - max(slot, 0))", doc)
+        self.assertIn("104", doc)
+        self.assertIn("35일", doc)
 
 
 if __name__ == "__main__":

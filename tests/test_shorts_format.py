@@ -4,6 +4,9 @@ import unittest
 
 from shorts_format import (
     AUDIO_CONFIGS,
+    EDGE_TTS_PITCH,
+    EDGE_TTS_RATE,
+    EDGE_VOICES,
     OVERRIDES_CSV,
     SAFE_BOTTOM,
     SAFE_LEFT,
@@ -143,6 +146,12 @@ class FormatTests(unittest.TestCase):
         self.assertNotEqual(VOICES["male"]["name"], VOICES["female"]["name"])
         self.assertLess(AUDIO_CONFIGS["male"]["pitch"], 0)
         self.assertGreater(AUDIO_CONFIGS["female"]["pitch"], 0)
+        self.assertEqual(EDGE_VOICES["female"], "ko-KR-SunHiNeural")
+        self.assertEqual(EDGE_VOICES["male"], "ko-KR-InJoonNeural")
+        self.assertNotEqual(EDGE_VOICES["male"], EDGE_VOICES["female"])
+        self.assertEqual(EDGE_TTS_RATE, "+20%")
+        self.assertTrue(EDGE_TTS_PITCH["male"].startswith("-"))
+        self.assertTrue(EDGE_TTS_PITCH["female"].startswith("+"))
 
     def test_sheet_hook_column_wins_without_touching_script(self):
         ep = prepare_episode(episode_row(훅="시트에 적은 훅", 심리="시트 심리"))
