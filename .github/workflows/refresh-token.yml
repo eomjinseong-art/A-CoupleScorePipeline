@@ -7,6 +7,12 @@ on:
   schedule:
     - cron: "41 1 * * 1"
   workflow_dispatch: {}
+  # One merge of this file runs the refresh when workflow_dispatch is unavailable.
+  # Remove this push trigger after that run so later edits do not rotate the token.
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/refresh-token.yml
 
 permissions:
   contents: write
