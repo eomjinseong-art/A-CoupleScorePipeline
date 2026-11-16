@@ -54,11 +54,11 @@ class ReconcileQueueTest(unittest.TestCase):
     def test_queue_report_on_snapshot_morning(self):
         now = datetime(2026, 11, 2, 3, 5, tzinfo=timezone.utc)
         report = reconcile.queue_report(now=now)
-        self.assertEqual(report["total"], 104)
+        self.assertEqual(report["total"], 144)
         self.assertEqual(report["slot"], 34)
         self.assertEqual(report["current_id"], "R035")
-        self.assertEqual(report["remaining_items"], 70)
-        self.assertEqual(report["remaining_days"], 35.0)
+        self.assertEqual(report["remaining_items"], 110)
+        self.assertEqual(report["remaining_days"], 55.0)
         self.assertTrue(report["path"].endswith("reconcile_episodes.json"))
 
     def test_queue_report_evening_and_past_the_end(self):
@@ -66,8 +66,8 @@ class ReconcileQueueTest(unittest.TestCase):
         report = reconcile.queue_report(now=evening)
         self.assertEqual(report["slot"], 35)
         self.assertEqual(report["current_id"], "R036")
-        self.assertEqual(report["remaining_items"], 69)
-        self.assertEqual(report["remaining_days"], 34.5)
+        self.assertEqual(report["remaining_items"], 109)
+        self.assertEqual(report["remaining_days"], 54.5)
         done = reconcile.queue_report(queue=self.queue, now=datetime(2027, 6, 1, tzinfo=timezone.utc))
         self.assertEqual(done["remaining_items"], 0)
         self.assertEqual(done["remaining_days"], 0)
