@@ -491,23 +491,26 @@ def upload_youtube(video_path, title, description, tags=None):
         upload_resp = requests.put(upload_url, headers={"Content-Type": "video/mp4"}, data=f)
 
     if upload_resp.status_code in (200, 201):
-        vid = upload_resp.json().get("id")
+        uploaded = upload_resp.json()
+        vid = uploaded.get("id")
         print(f"  ✅ YouTube 업로드 완료: https://youtube.com/shorts/{vid}")
-        post_disclosure_comment(access_token, vid)
+        post_disclosure_comment(access_token, vid, (uploaded.get("snippet") or {}).get("channelId"))
         return vid
     else:
         print(f"  ❌ YouTube 업로드 실패 ({upload_resp.status_code}): {upload_resp.text[:300]}")
         return None
 
 
-def post_disclosure_comment(access_token, video_id):
+def post_disclosure_comment(access_token, video_id, channel_id=None):
     """고지 문구 + 링크 댓글. 실패해도 업로드는 유지. 상단 고정은 API 미지원 → Studio에서 직접."""
     try:
         resp = requests.post(
             "https://www.googleapis.com/youtube/v3/commentThreads?part=snippet",
             headers={"Authorization": f"Bearer {access_token}"},
-            json={"snippet": {"videoId": video_id,
-                              "topLevelComment": {"snippet": {"textOriginal": comment_text()}}}},
+            json={"snippet": dict(
+                {"videoId": video_id,
+                 "topLevelComment": {"snippet": {"textOriginal": comment_text()}}},
+                **({"channelId": channel_id} if channel_id else {}))},
             timeout=30,
         )
         if resp.status_code in (200, 201):
