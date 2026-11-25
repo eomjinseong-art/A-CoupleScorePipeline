@@ -33,6 +33,7 @@ from shorts_format import (
 
 import reconcile
 from scripts.github_issues import report_oauth_refresh_failure
+from monetization import with_disclosure, comment_text
 
 # === 환경 변수 ===
 # 유료 TTS 키는 워크플로에서 넣지 않는다. 프로세스에 있을 때만 선택 폴백이 된다.
@@ -455,23 +456,31 @@ def upload_youtube(video_path, title, description, tags=None):
     print("  YouTube 토큰 갱신 성공")
     filesize = os.path.getsize(video_path)
 
-    init_resp = requests.post(
-        "https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status",
-        headers={
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json",
-            "X-Upload-Content-Type": "video/mp4",
-            "X-Upload-Content-Length": str(filesize)
+    description = with_disclosure(description)
+    body = {
+        "snippet": {
+            "title": title, "description": description,
+            "tags": list(tags or YOUTUBE_TAGS),
+            "categoryId": "22"
         },
-        json={
-            "snippet": {
-                "title": title, "description": description,
-                "tags": list(tags or YOUTUBE_TAGS),
-                "categoryId": "22"
-            },
-            "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": False}
-        }
-    )
+        "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": False},
+        # '유료 광고 포함' 표시 (쿠팡 파트너스 링크)
+        "paidProductPlacementDetails": {"hasPaidProductPlacement": True},
+    }
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "X-Upload-Content-Type": "video/mp4",
+        "X-Upload-Content-Length": str(filesize)
+    }
+    base = "https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable"
+    init_resp = requests.post(base + "&part=snippet,status,paidProductPlacementDetails",
+                              headers=headers, json=body)
+    if init_resp.status_code == 400:
+        # 유료 광고 표시를 API가 거부해도 업로드 자체는 막지 않는다.
+        print(f"  [경고] 유료 광고 표시 없이 다시 시도 ({init_resp.text[:200]})")
+        body.pop("paidProductPlacementDetails", None)
+        init_resp = requests.post(base + "&part=snippet,status", headers=headers, json=body)
     if init_resp.status_code != 200:
         print(f"  ❌ 업로드 초기화 실패 ({init_resp.status_code}): {init_resp.text[:300]}")
         return None
@@ -482,12 +491,35 @@ def upload_youtube(video_path, title, description, tags=None):
         upload_resp = requests.put(upload_url, headers={"Content-Type": "video/mp4"}, data=f)
 
     if upload_resp.status_code in (200, 201):
-        vid = upload_resp.json().get("id")
+        uploaded = upload_resp.json()
+        vid = uploaded.get("id")
         print(f"  ✅ YouTube 업로드 완료: https://youtube.com/shorts/{vid}")
+        post_disclosure_comment(access_token, vid, (uploaded.get("snippet") or {}).get("channelId"))
         return vid
     else:
         print(f"  ❌ YouTube 업로드 실패 ({upload_resp.status_code}): {upload_resp.text[:300]}")
         return None
+
+
+def post_disclosure_comment(access_token, video_id, channel_id=None):
+    """고지 문구 + 링크 댓글. 실패해도 업로드는 유지. 상단 고정은 API 미지원 → Studio에서 직접."""
+    try:
+        resp = requests.post(
+            "https://www.googleapis.com/youtube/v3/commentThreads?part=snippet",
+            headers={"Authorization": f"Bearer {access_token}"},
+            json={"snippet": dict(
+                {"videoId": video_id,
+                 "topLevelComment": {"snippet": {"textOriginal": comment_text()}}},
+                **({"channelId": channel_id} if channel_id else {}))},
+            timeout=30,
+        )
+        if resp.status_code in (200, 201):
+            print("  고지 댓글 게시 완료 (상단 고정은 Studio에서 직접)")
+        else:
+            print(f"  [경고] 고지 댓글 실패 ({resp.status_code}): {resp.text[:200]}"
+                  " — youtube.force-ssl 스코프가 없으면 재인증 필요")
+    except Exception as e:
+        print(f"  [경고] 고지 댓글 실패: {e}")
 
 
 # ===== Threads 포스팅 =====
